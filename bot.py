@@ -64,6 +64,19 @@ FFMPEG_OPTIONS = {
     "options": "-vn",
 }
 
+
+def build_ffmpeg_options(http_headers: dict) -> dict:
+    """Matches ffmpeg's request headers to whatever yt-dlp used to resolve the stream
+    URL. Without this, ffmpeg fetches with its own default headers, which YouTube's CDN
+    frequently rejects with 403 Forbidden even though the URL itself is valid."""
+    if not http_headers:
+        return FFMPEG_OPTIONS
+
+    header_lines = "".join(f"{key}: {value}\r\n" for key, value in http_headers.items())
+    before_options = f'{FFMPEG_OPTIONS["before_options"]} -headers "{header_lines}"'
+    return {"before_options": before_options, "options": FFMPEG_OPTIONS["options"]}
+
+
 YTDL_FLAT_OPTIONS = {
     "quiet": True,
     "extract_flat": "in_playlist",
@@ -217,6 +230,7 @@ class Song:
         duration: int | None,
         thumbnail: str | None,
         requester: discord.Member,
+        http_headers: dict | None = None,
     ):
         self.source_url = source_url
         self.title = title
@@ -224,6 +238,10 @@ class Song:
         self.duration = duration
         self.thumbnail = thumbnail
         self.requester = requester
+        # The headers yt-dlp actually used to resolve source_url. YouTube's CDN ties the
+        # signed stream URL to these (mainly User-Agent); ffmpeg must present the same
+        # ones when fetching it, or the request gets rejected with 403 Forbidden.
+        self.http_headers = http_headers or {}
 
 
 class GuildState:
@@ -400,6 +418,7 @@ async def extract_song(query: str, requester: discord.Member) -> Song:
         duration=data.get("duration"),
         thumbnail=data.get("thumbnail"),
         requester=requester,
+        http_headers=data.get("http_headers"),
     )
 
 
@@ -773,7 +792,7 @@ async def start_track(guild: discord.Guild, channel: discord.abc.Messageable, in
     state.elapsed_offset = 0.0
     state.play_resumed_at = time.monotonic()
 
-    audio = discord.FFmpegPCMAudio(song.source_url, **FFMPEG_OPTIONS)
+    audio = discord.FFmpegPCMAudio(song.source_url, **build_ffmpeg_options(song.http_headers))
     source = discord.PCMVolumeTransformer(audio, volume=state.volume)
 
     def after_playing(error: Exception | None):
