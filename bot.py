@@ -7,6 +7,7 @@ import sys
 import time
 import urllib.request
 
+from aiohttp import web
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -1886,6 +1887,19 @@ async def delplaylist(ctx: commands.Context, *, name: str):
     await send_temp(ctx, f"Deleted **{name}**.")
 
 
+async def start_health_server() -> None:
+    """Binds to $PORT so host platforms that require an open port (e.g. Render Web
+    Services) see a live listener, even though this bot has no real HTTP functionality."""
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+    app.router.add_get("/", lambda request: web.Response(text="OK"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Health check server listening on port {port}.")
+
+
 async def main() -> None:
     if not TOKEN:
         raise RuntimeError(
@@ -1900,6 +1914,7 @@ async def main() -> None:
     await db.init_pool(DATABASE_URL)
     await db.ensure_schema()
     await initialize_data()
+    await start_health_server()
 
     try:
         async with bot:
