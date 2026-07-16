@@ -39,7 +39,25 @@ YTDL_OPTIONS = {
     "quiet": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
+    # "android"/"tv" clients don't require the newer PO-token challenge that "web" often
+    # triggers on datacenter IPs, so try those first; fall back to "web" if they fail.
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "tv", "web"],
+        }
+    },
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    },
 }
+
+# Optional escape hatch: if YouTube's bot-detection keeps blocking the host's IP even
+# with the client fallback above, export cookies.txt from a real logged-in YouTube
+# session, upload it as a Render "Secret File", and point this env var at its path.
+YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE")
+if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+    YTDL_OPTIONS["cookiefile"] = YTDLP_COOKIES_FILE
 
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -328,9 +346,27 @@ def build_progress_bar(elapsed: float, duration: int | None) -> str:
 
 async def extract_song(query: str, requester: discord.Member) -> Song:
     loop = asyncio.get_event_loop()
-    data = await loop.run_in_executor(
-        None, lambda: ytdl.extract_info(query, download=False)
-    )
+
+    data = None
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            data = await loop.run_in_executor(
+                None, lambda: ytdl.extract_info(query, download=False)
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+            # Only retry transient rate-limiting; anything else (private video, region
+            # block, etc.) won't be fixed by trying again.
+            if "429" in str(exc) or "Too Many Requests" in str(exc):
+                if attempt < 2:
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+            raise
+
+    if data is None:
+        raise last_exc
 
     if "entries" in data:
         data = data["entries"][0]
