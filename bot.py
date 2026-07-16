@@ -56,8 +56,24 @@ YTDL_OPTIONS = {
 # with the client fallback above, export cookies.txt from a real logged-in YouTube
 # session, upload it as a Render "Secret File", and point this env var at its path.
 YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE")
-if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+print(f"[cookies] YTDLP_COOKIES_FILE env var = {YTDLP_COOKIES_FILE!r}")
+
+_secrets_dir = "/etc/secrets"
+if os.path.isdir(_secrets_dir):
+    print(f"[cookies] Contents of {_secrets_dir}: {os.listdir(_secrets_dir)!r}")
+else:
+    print(f"[cookies] {_secrets_dir} does not exist on this host.")
+
+if not YTDLP_COOKIES_FILE:
+    print("[cookies] No YTDLP_COOKIES_FILE set — running without YouTube cookies.")
+elif not os.path.exists(YTDLP_COOKIES_FILE):
+    print(f"[cookies] YTDLP_COOKIES_FILE points to {YTDLP_COOKIES_FILE!r}, but that path does not exist.")
+else:
     YTDL_OPTIONS["cookiefile"] = YTDLP_COOKIES_FILE
+    print(
+        f"[cookies] Loaded cookies from {YTDLP_COOKIES_FILE!r} "
+        f"({os.path.getsize(YTDLP_COOKIES_FILE)} bytes)."
+    )
 
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
