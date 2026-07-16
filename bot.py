@@ -344,29 +344,51 @@ def build_progress_bar(elapsed: float, duration: int | None) -> str:
     return f"`{format_duration(elapsed)} {bar} {format_duration(duration)}`"
 
 
+YOUTUBE_BLOCK_SIGNATURES = (
+    "429",
+    "Too Many Requests",
+    "Sign in to confirm",
+    "not a bot",
+    "cookies",
+)
+
+YTSEARCH_PREFIX_RE = re.compile(r"^ytsearch\d*:", re.IGNORECASE)
+
+
+def _is_youtube_blocked_error(exc: Exception) -> bool:
+    message = str(exc)
+    return any(signature in message for signature in YOUTUBE_BLOCK_SIGNATURES)
+
+
+def _to_soundcloud_query(query: str) -> str:
+    stripped = YTSEARCH_PREFIX_RE.sub("", query).strip()
+    if stripped.lower().startswith("scsearch"):
+        return stripped
+    return f"scsearch1:{stripped}"
+
+
 async def extract_song(query: str, requester: discord.Member) -> Song:
     loop = asyncio.get_event_loop()
 
-    data = None
-    last_exc: Exception | None = None
-    for attempt in range(3):
-        try:
-            data = await loop.run_in_executor(
-                None, lambda: ytdl.extract_info(query, download=False)
-            )
-            break
-        except Exception as exc:
-            last_exc = exc
-            # Only retry transient rate-limiting; anything else (private video, region
-            # block, etc.) won't be fixed by trying again.
-            if "429" in str(exc) or "Too Many Requests" in str(exc):
-                if attempt < 2:
-                    await asyncio.sleep(2 * (attempt + 1))
-                    continue
+    try:
+        data = await loop.run_in_executor(
+            None, lambda: ytdl.extract_info(query, download=False)
+        )
+    except Exception as exc:
+        if not _is_youtube_blocked_error(exc):
             raise
 
-    if data is None:
-        raise last_exc
+        fallback_query = _to_soundcloud_query(query)
+        print(f"YouTube blocked '{query}', falling back to SoundCloud ('{fallback_query}'): {exc}")
+
+        try:
+            data = await loop.run_in_executor(
+                None, lambda: ytdl.extract_info(fallback_query, download=False)
+            )
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                f"YouTube blocked this request and the SoundCloud fallback also failed: {fallback_exc}"
+            ) from fallback_exc
 
     if "entries" in data:
         data = data["entries"][0]
