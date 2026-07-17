@@ -39,11 +39,14 @@ YTDL_OPTIONS = {
     "quiet": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
-    # "android"/"tv" clients don't require the newer PO-token challenge that "web" often
-    # triggers on datacenter IPs, so try those first; fall back to "web" if they fail.
+    # "android"/"ios" skip the JS n-signature challenge but can't use our cookies file
+    # (yt-dlp drops cookies for those clients), so with cookies now working we stick to
+    # the "web"-family clients, which do accept cookies. That means yt-dlp needs a real
+    # JS runtime to solve the n-challenge — see the Dockerfile, which installs Node.js
+    # for exactly this reason.
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "tv", "web"],
+            "player_client": ["web", "mweb"],
         }
     },
     "http_headers": {
