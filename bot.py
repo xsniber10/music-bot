@@ -41,12 +41,12 @@ YTDL_OPTIONS = {
     "source_address": "0.0.0.0",
     # "web"/"mweb" need a per-video GVS PO Token, now supplied by the bgutil-ytdlp-pot-
     # provider sidecar (started by start.sh) that this "youtubepot-bgutilhttp" entry
-    # points yt-dlp at. "tv_embedded" is kept as a last-resort fallback since it doesn't
-    # need a token at all, in case the provider is ever unreachable — though it can't
-    # play videos with embedding disabled/age-restricted.
+    # points yt-dlp at. "tv_simply" ("tv_embedded" was removed from yt-dlp) is kept as a
+    # last-resort fallback since it doesn't need a token at all, in case the provider is
+    # ever unreachable — though it can't play videos with embedding disabled/age-restricted.
     "extractor_args": {
         "youtube": {
-            "player_client": ["web", "mweb", "tv_embedded"],
+            "player_client": ["web", "mweb", "tv_simply"],
         },
         "youtubepot-bgutilhttp": {
             "base_url": ["http://127.0.0.1:4416"],
