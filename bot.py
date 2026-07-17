@@ -43,8 +43,9 @@ YTDL_OPTIONS = {
     # yt-dlp's n-signature solver needs both a JS runtime and the separate yt-dlp-ejs
     # package (the actual solver scripts) — see https://github.com/yt-dlp/yt-dlp/wiki/EJS.
     # It defaults to looking for "deno", which we don't have; we only install Node.js
-    # (see Dockerfile), so point it there explicitly.
-    "js_runtimes": ["node"],
+    # (see Dockerfile), so point it there explicitly. Unlike the "--js-runtimes" CLI flag,
+    # the Python API takes a dict of {runtime: {config}}, not a list.
+    "js_runtimes": {"node": {}},
     # "web"/"mweb" need a per-video GVS PO Token, now supplied by the bgutil-ytdlp-pot-
     # provider sidecar (started by start.sh) that this "youtubepot-bgutilhttp" entry
     # points yt-dlp at. "tv_simply" ("tv_embedded" was removed from yt-dlp) is kept as a
