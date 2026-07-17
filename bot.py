@@ -769,27 +769,30 @@ async def start_track(guild: discord.Guild, channel: discord.abc.Messageable, in
         return
 
     song = state.session_songs[index]
-    if not song.source_url:
-        placeholder_key = song.webpage_url
-        try:
-            resolved = await extract_song(song.webpage_url, song.requester)
-        except Exception as exc:
-            print(f"Failed to resolve queued song '{song.webpage_url}': {exc}")
-            del state.session_songs[index]
-            if not state.session_songs:
-                state.current_index = -1
-                stop_progress_task(state)
-                await render_panel(guild, channel)
-                return
-            next_index = index if index < len(state.session_songs) else 0
-            await start_track(guild, channel, next_index)
+    # Always re-resolve immediately before playing, even if source_url was already
+    # populated (e.g. from playlist loading) — YouTube's PO-Token-authenticated stream
+    # URLs are short-lived, and a track resolved minutes ago (while earlier queue
+    # entries were still playing) can 403 by the time it's actually its turn.
+    placeholder_key = song.webpage_url
+    try:
+        resolved = await extract_song(song.webpage_url, song.requester)
+    except Exception as exc:
+        print(f"Failed to resolve queued song '{song.webpage_url}': {exc}")
+        del state.session_songs[index]
+        if not state.session_songs:
+            state.current_index = -1
+            stop_progress_task(state)
+            await render_panel(guild, channel)
             return
-        state.session_songs[index] = resolved
-        song = resolved
-        if resolved.webpage_url != placeholder_key and placeholder_key in playlist_data["library"]:
-            del playlist_data["library"][placeholder_key]
-            await db.delete_library_entry(placeholder_key)
-        await save_song_to_library(song)
+        next_index = index if index < len(state.session_songs) else 0
+        await start_track(guild, channel, next_index)
+        return
+    state.session_songs[index] = resolved
+    song = resolved
+    if resolved.webpage_url != placeholder_key and placeholder_key in playlist_data["library"]:
+        del playlist_data["library"][placeholder_key]
+        await db.delete_library_entry(placeholder_key)
+    await save_song_to_library(song)
 
     stop_progress_task(state)
     state.current_index = index
