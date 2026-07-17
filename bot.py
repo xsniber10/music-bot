@@ -39,15 +39,18 @@ YTDL_OPTIONS = {
     "quiet": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
-    # "web"/"mweb" now require a per-video GVS PO Token we don't have a provider for
-    # (see https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide). "tv_embedded" and
-    # "web_safari" don't need one, so try those first; "web" is kept last as a fallback
-    # for whatever formats it can still serve without a token. Trade-off: "tv_embedded"
-    # can't play videos with embedding disabled/age-restricted.
+    # "web"/"mweb" need a per-video GVS PO Token, now supplied by the bgutil-ytdlp-pot-
+    # provider sidecar (started by start.sh) that this "youtubepot-bgutilhttp" entry
+    # points yt-dlp at. "tv_embedded" is kept as a last-resort fallback since it doesn't
+    # need a token at all, in case the provider is ever unreachable — though it can't
+    # play videos with embedding disabled/age-restricted.
     "extractor_args": {
         "youtube": {
-            "player_client": ["tv_embedded", "web_safari", "web"],
-        }
+            "player_client": ["web", "mweb", "tv_embedded"],
+        },
+        "youtubepot-bgutilhttp": {
+            "base_url": ["http://127.0.0.1:4416"],
+        },
     },
     "http_headers": {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

@@ -1,5 +1,6 @@
 discord.py
 yt-dlp
+bgutil-ytdlp-pot-provider
 PyNaCl
 python-dotenv
 davey
