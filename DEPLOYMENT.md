@@ -1,5 +1,10 @@
 # Deploying MusicBot: GitHub + Supabase + Render
 
+> **Note:** the bot currently runs locally (Windows, via Scheduled Tasks) rather than on
+> Render — YouTube was rejecting cookie-authenticated requests from Render's datacenter
+> IP range. This guide is kept as a fallback in case Render (or another cloud host) is
+> worth revisiting later; it's not the active setup.
+
 ## What changed in the code
 
 - `bot.py` no longer reads/writes `playlists.json`. All persistence (library, saved

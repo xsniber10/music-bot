@@ -43,12 +43,14 @@ YTDL_OPTIONS = {
     # yt-dlp's n-signature solver needs both a JS runtime and the separate yt-dlp-ejs
     # package (the actual solver scripts) — see https://github.com/yt-dlp/yt-dlp/wiki/EJS.
     # It defaults to looking for "deno", which we don't have; we only install Node.js
-    # (see Dockerfile), so point it there explicitly. Unlike the "--js-runtimes" CLI flag,
-    # the Python API takes a dict of {runtime: {config}}, not a list.
+    # (system-wide locally; via the Dockerfile if running that way instead), so point it
+    # there explicitly. Unlike the "--js-runtimes" CLI flag, the Python API takes a dict
+    # of {runtime: {config}}, not a list.
     "js_runtimes": {"node": {}},
-    # "web"/"mweb" need a per-video GVS PO Token, now supplied by the bgutil-ytdlp-pot-
-    # provider sidecar (started by start.sh) that this "youtubepot-bgutilhttp" entry
-    # points yt-dlp at. "tv_simply" ("tv_embedded" was removed from yt-dlp) is kept as a
+    # "web"/"mweb" need a per-video GVS PO Token, supplied by the bgutil-ytdlp-pot-provider
+    # sidecar that this "youtubepot-bgutilhttp" entry points yt-dlp at (run it yourself
+    # locally, e.g. via a scheduled task; start.sh does this instead if running via
+    # Docker). "tv_simply" ("tv_embedded" was removed from yt-dlp) is kept as a
     # last-resort fallback since it doesn't need a token at all, in case the provider is
     # ever unreachable — though it can't play videos with embedding disabled/age-restricted.
     "extractor_args": {
@@ -67,7 +69,9 @@ YTDL_OPTIONS = {
 
 # Optional escape hatch: if YouTube's bot-detection keeps blocking the host's IP even
 # with the client fallback above, export cookies.txt from a real logged-in YouTube
-# session, upload it as a Render "Secret File", and point this env var at its path.
+# session (a dedicated account, never used anywhere else — see the incognito export
+# procedure on yt-dlp's wiki) and point this env var at its local path. Only needed as
+# a Render "Secret File" if running there instead of locally.
 YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE")
 print(f"[cookies] YTDLP_COOKIES_FILE env var = {YTDLP_COOKIES_FILE!r}")
 
