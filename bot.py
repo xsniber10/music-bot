@@ -47,16 +47,16 @@ YTDL_OPTIONS = {
     # there explicitly. Unlike the "--js-runtimes" CLI flag, the Python API takes a dict
     # of {runtime: {config}}, not a list.
     "js_runtimes": {"node": {}},
-    # "web"/"mweb" need a per-video GVS PO Token, supplied by the bgutil-ytdlp-pot-provider
-    # sidecar that this "youtubepot-bgutilhttp" entry points yt-dlp at (run it yourself
-    # locally, e.g. via a scheduled task; start.sh does this instead if running via
-    # Docker). "tv_simply" ("tv_embedded" was removed from yt-dlp) is kept as a
-    # last-resort fallback since it doesn't need a token at all, in case the provider is
-    # ever unreachable — though it can't play videos with embedding disabled/age-restricted.
+    # Deliberately NOT overriding "player_client": YouTube's anti-bot requirements keep
+    # shifting (this conversation alone saw tv_embedded get removed, EJS become required,
+    # and GVS PO Tokens get bound to specific clients), and yt-dlp's own default client
+    # selection is actively kept up to date with those changes. An override we hardcoded
+    # earlier ended up frozen on a combination YouTube later started rejecting, while
+    # yt-dlp's current default (auto-picking clients like android_vr/web_safari) worked
+    # immediately. The bgutil-ytdlp-pot-provider sidecar still supplies PO Tokens for
+    # whichever client yt-dlp picks (run it yourself locally, e.g. via a scheduled task;
+    # start.sh does this instead if running via Docker).
     "extractor_args": {
-        "youtube": {
-            "player_client": ["web", "mweb", "tv_simply"],
-        },
         "youtubepot-bgutilhttp": {
             "base_url": ["http://127.0.0.1:4416"],
         },
