@@ -39,14 +39,14 @@ YTDL_OPTIONS = {
     "quiet": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
-    # "android"/"ios" skip the JS n-signature challenge but can't use our cookies file
-    # (yt-dlp drops cookies for those clients), so with cookies now working we stick to
-    # the "web"-family clients, which do accept cookies. That means yt-dlp needs a real
-    # JS runtime to solve the n-challenge — see the Dockerfile, which installs Node.js
-    # for exactly this reason.
+    # "web"/"mweb" now require a per-video GVS PO Token we don't have a provider for
+    # (see https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide). "tv_embedded" and
+    # "web_safari" don't need one, so try those first; "web" is kept last as a fallback
+    # for whatever formats it can still serve without a token. Trade-off: "tv_embedded"
+    # can't play videos with embedding disabled/age-restricted.
     "extractor_args": {
         "youtube": {
-            "player_client": ["web", "mweb"],
+            "player_client": ["tv_embedded", "web_safari", "web"],
         }
     },
     "http_headers": {
