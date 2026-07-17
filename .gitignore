@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 playlists.json
 bot_output.log
+cookies.txt
+venv/
