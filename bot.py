@@ -103,6 +103,9 @@ AUTO_DISCONNECT_SECONDS = 120
 PROGRESS_UPDATE_SECONDS = 40
 PROGRESS_BAR_LENGTH = 15
 MAX_PLAYLIST_SONGS = 100
+# Spacing out playlist track lookups avoids bursting YouTube with rapid-fire requests,
+# which is what triggers its IP-based rate limiting (429) and bot-detection checks.
+PLAYLIST_LOAD_DELAY_SECONDS = 1.5
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 ytdl_flat = yt_dlp.YoutubeDL(YTDL_FLAT_OPTIONS)
@@ -378,51 +381,12 @@ def build_progress_bar(elapsed: float, duration: int | None) -> str:
     return f"`{format_duration(elapsed)} {bar} {format_duration(duration)}`"
 
 
-YOUTUBE_BLOCK_SIGNATURES = (
-    "429",
-    "Too Many Requests",
-    "Sign in to confirm",
-    "not a bot",
-    "cookies",
-)
-
-YTSEARCH_PREFIX_RE = re.compile(r"^ytsearch\d*:", re.IGNORECASE)
-
-
-def _is_youtube_blocked_error(exc: Exception) -> bool:
-    message = str(exc)
-    return any(signature in message for signature in YOUTUBE_BLOCK_SIGNATURES)
-
-
-def _to_soundcloud_query(query: str) -> str:
-    stripped = YTSEARCH_PREFIX_RE.sub("", query).strip()
-    if stripped.lower().startswith("scsearch"):
-        return stripped
-    return f"scsearch1:{stripped}"
-
-
 async def extract_song(query: str, requester: discord.Member) -> Song:
     loop = asyncio.get_event_loop()
 
-    try:
-        data = await loop.run_in_executor(
-            None, lambda: ytdl.extract_info(query, download=False)
-        )
-    except Exception as exc:
-        if not _is_youtube_blocked_error(exc):
-            raise
-
-        fallback_query = _to_soundcloud_query(query)
-        print(f"YouTube blocked '{query}', falling back to SoundCloud ('{fallback_query}'): {exc}")
-
-        try:
-            data = await loop.run_in_executor(
-                None, lambda: ytdl.extract_info(fallback_query, download=False)
-            )
-        except Exception as fallback_exc:
-            raise RuntimeError(
-                f"YouTube blocked this request and the SoundCloud fallback also failed: {fallback_exc}"
-            ) from fallback_exc
+    data = await loop.run_in_executor(
+        None, lambda: ytdl.extract_info(query, download=False)
+    )
 
     if "entries" in data:
         data = data["entries"][0]
@@ -1734,7 +1698,9 @@ async def handle_playlist_play(
     first_new_index = len(state.session_songs)
 
     async with channel.typing():
-        for video_url in urls:
+        for index, video_url in enumerate(urls):
+            if index > 0:
+                await asyncio.sleep(PLAYLIST_LOAD_DELAY_SECONDS)
             try:
                 song = await extract_song(video_url, member)
             except Exception as exc:
@@ -1886,7 +1852,9 @@ async def loadplaylist(ctx: commands.Context, *, name: str):
     failed = 0
     first_new_index = len(state.session_songs)
     async with ctx.typing():
-        for url in urls:
+        for index, url in enumerate(urls):
+            if index > 0:
+                await asyncio.sleep(PLAYLIST_LOAD_DELAY_SECONDS)
             try:
                 song = await extract_song(url, ctx.author)
             except Exception as exc:
