@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import html as html_module
 import json
 import os
@@ -76,9 +77,16 @@ elif not os.path.exists(YTDLP_COOKIES_FILE):
     print(f"[cookies] YTDLP_COOKIES_FILE points to {YTDLP_COOKIES_FILE!r}, but that path does not exist.")
 else:
     YTDL_OPTIONS["cookiefile"] = YTDLP_COOKIES_FILE
+    with open(YTDLP_COOKIES_FILE, "rb") as _f:
+        _cookie_bytes = _f.read()
+    # A byte count alone can't tell two different exports apart if they happen to be the
+    # same length, and Render's secret-file mtimes reflect mount time, not upload time —
+    # this hash is the only reliable way to confirm the content actually changed between
+    # deploys when comparing startup logs.
+    _cookie_hash = hashlib.sha256(_cookie_bytes).hexdigest()[:12]
     print(
         f"[cookies] Loaded cookies from {YTDLP_COOKIES_FILE!r} "
-        f"({os.path.getsize(YTDLP_COOKIES_FILE)} bytes)."
+        f"({len(_cookie_bytes)} bytes, sha256={_cookie_hash})."
     )
 
 FFMPEG_OPTIONS = {
