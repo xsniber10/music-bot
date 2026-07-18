@@ -19,6 +19,10 @@ CREATE TABLE IF NOT EXISTS favorites (
     shortcut_name TEXT PRIMARY KEY,
     url TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS verified_users (
+    user_id BIGINT PRIMARY KEY
+);
 """
 
 _pool: asyncpg.Pool | None = None
@@ -120,3 +124,37 @@ async def upsert_favorite(shortcut_name: str, url: str) -> None:
 async def delete_favorite(shortcut_name: str) -> None:
     async with _pool.acquire() as conn:
         await conn.execute("DELETE FROM favorites WHERE shortcut_name = $1", shortcut_name)
+
+
+async def load_verified_users() -> set[int]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM verified_users")
+    return {row["user_id"] for row in rows}
+
+
+async def verify_user(user_id: int) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO verified_users (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            user_id,
+        )
+
+
+async def unverify_user(user_id: int) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute("DELETE FROM verified_users WHERE user_id = $1", user_id)
+
+
+async def wipe_music_data() -> None:
+    """Clears every saved song (library, playlists, favorites). Does not touch
+    verified_users — that's access control, not song data."""
+    async with _pool.acquire() as conn:
+        await conn.execute("TRUNCATE library, playlists, favorites")
+
+
+async def get_song_counts() -> dict[str, int]:
+    async with _pool.acquire() as conn:
+        library = await conn.fetchval("SELECT COUNT(*) FROM library")
+        playlists = await conn.fetchval("SELECT COUNT(*) FROM playlists")
+        favorites = await conn.fetchval("SELECT COUNT(*) FROM favorites")
+    return {"library": library, "playlists": playlists, "favorites": favorites}

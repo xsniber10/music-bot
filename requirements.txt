@@ -6,3 +6,4 @@ PyNaCl
 python-dotenv
 davey
 asyncpg
+customtkinter

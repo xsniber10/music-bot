@@ -23,6 +23,14 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# Password gate: when VERIFICATION_ENABLED is true, users must run !verify <password>
+# once before they can use any other command. Verified user IDs are cached in memory
+# (verified_user_ids, populated at startup) so the check below doesn't hit the database
+# on every command; verify_user()/unverify_user() keep the database in sync.
+BOT_PASSWORD = os.getenv("BOT_PASSWORD")
+VERIFICATION_ENABLED = os.getenv("VERIFICATION_ENABLED", "false").strip().lower() == "true"
+verified_user_ids: set[int] = set()
+
 # Paste your Spotify playlist link here (e.g. https://open.spotify.com/playlist/xxxxxxxxxxxx)
 SPOTIFY_PLAYLIST_URL = os.getenv(
     "SPOTIFY_PLAYLIST_URL", "https://open.spotify.com/playlist/0IalEO1MniD8cDpAfj39jC?si=7114a6a5582d40ea"
@@ -941,10 +949,11 @@ async def dedupe_song_library() -> None:
 
 
 async def initialize_data() -> None:
-    global playlist_data
+    global playlist_data, verified_user_ids
     playlist_data = await db.load_all_data()
     await seed_song_library()
     await dedupe_song_library()
+    verified_user_ids = await db.load_verified_users()
 
 
 class QueueSelect(discord.ui.Select):
@@ -1544,6 +1553,39 @@ class MusicControlView(discord.ui.View):
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print("Bot is online and ready.")
+
+
+@bot.check
+async def require_verification(ctx: commands.Context) -> bool:
+    if not VERIFICATION_ENABLED or ctx.command.name == "verify":
+        return True
+    if ctx.author.id in verified_user_ids:
+        return True
+    await send_temp(ctx, "🔒 You need to verify first — use `!verify <password>`.")
+    return False
+
+
+@bot.command(name="verify")
+async def verify(ctx: commands.Context, *, password: str = ""):
+    if not VERIFICATION_ENABLED:
+        await send_temp(ctx, "Verification isn't enabled right now.")
+        return
+    if ctx.author.id in verified_user_ids:
+        await send_temp(ctx, "You're already verified.")
+        return
+    if not BOT_PASSWORD or password != BOT_PASSWORD:
+        await send_temp(ctx, "❌ Incorrect password.")
+        return
+    verified_user_ids.add(ctx.author.id)
+    await db.verify_user(ctx.author.id)
+    await send_temp(ctx, "✅ Verified! You can now use the bot.")
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
+    if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
+        return
+    print(f"Command error in '{ctx.command}': {error}")
 
 
 @bot.after_invoke
