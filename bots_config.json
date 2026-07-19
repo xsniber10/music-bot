@@ -1,0 +1,44 @@
+[
+  {
+    "id": "music_bot",
+    "name": "Music Bot",
+    "icon": "🎵",
+    "directory": "C:\\Users\\Madof\\Desktop\\music-bot",
+    "interpreter": "venv\\Scripts\\python.exe",
+    "interpreter_args": ["-u"],
+    "main_script": "bot.py",
+    "log_file": "bot_output.log",
+    "process_name": "python.exe",
+    "match_mode": "venv_project",
+    "task_name": "MusicDiscordBot",
+    "self_heal": true
+  },
+  {
+    "id": "pot_provider",
+    "name": "PO Token Provider",
+    "icon": "🔑",
+    "directory": "C:\\Users\\Madof\\bgutil-ytdlp-pot-provider\\server",
+    "interpreter": "node",
+    "interpreter_args": [],
+    "main_script": "build\\main.js",
+    "log_file": "potprovider_output.log",
+    "process_name": "node.exe",
+    "match_mode": "cmdline",
+    "task_name": "BgutilPotProvider",
+    "self_heal": true
+  },
+  {
+    "id": "leaderboard_bot",
+    "name": "Leaderboard Bot",
+    "icon": "🏆",
+    "directory": "C:\\Users\\Madof\\Desktop\\oasis",
+    "interpreter": "venv\\Scripts\\python.exe",
+    "interpreter_args": ["-u"],
+    "main_script": "bot.py",
+    "log_file": "bot_output.log",
+    "process_name": "python.exe",
+    "match_mode": "venv_project",
+    "task_name": "LeaderboardDiscordBot",
+    "self_heal": true
+  }
+]
