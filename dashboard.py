@@ -32,15 +32,30 @@ ENV_PATH = BASE_DIR / ".env"
 LOG_PATH = BASE_DIR / "bot_output.log"
 COOKIES_PATH = BASE_DIR / "cookies.txt"
 
+# The leaderboard bot is a separate project (its own folder, venv, and git
+# repo — see LEADERBOARD_TASK_NAME below), but its log lives alongside it, so
+# this dashboard reads it directly by absolute path rather than relative to
+# BASE_DIR.
+LEADERBOARD_LOG_PATH = Path(r"C:\Users\Madof\Desktop\oasis") / "bot_output.log"
+
 BOT_TASK_NAME = "MusicDiscordBot"
 POTPROVIDER_TASK_NAME = "BgutilPotProvider"
+LEADERBOARD_TASK_NAME = "LeaderboardDiscordBot"
 
-# (process name, command-line substring) used to find each service's real process,
-# since Task Scheduler no longer tracks it directly — see the comment above
-# query_service_status.
+# Both music-bot and the leaderboard bot run an identically-named,
+# identically-invoked "venv\Scripts\python.exe -u bot.py" — since they're two
+# separate projects now, a plain command-line substring match on "bot.py" can
+# no longer tell them apart. Python entries below use mode "project": matched
+# by their venv's own path (e.g. "...\music-bot\venv\..."), then the match is
+# extended to any child process (the venv launcher re-execs into the real
+# interpreter, which reports a different, non-project-specific ExecutablePath)
+# via the parent/child PID chain. Node has no per-project venv equivalent, but
+# there's only one Node-based service, so its original substring match (mode
+# "cmdline") still works fine with no collision risk.
 _PROCESS_MATCH = {
-    BOT_TASK_NAME: ("python.exe", "bot.py"),
-    POTPROVIDER_TASK_NAME: ("node.exe", "main.js"),
+    BOT_TASK_NAME: ("python.exe", "project", "music-bot"),
+    POTPROVIDER_TASK_NAME: ("node.exe", "cmdline", "main.js"),
+    LEADERBOARD_TASK_NAME: ("python.exe", "project", "oasis"),
 }
 
 ACCENT = "#7c5cff"
@@ -136,7 +151,7 @@ def start_task(task_name: str) -> str:
 # "schtasks /query" and "schtasks /end" don't reflect or control the actual bot/
 # provider process. Status and stop/restart below check and kill the real process
 # directly instead.
-def _find_pids(process_name: str, cmdline_substring: str) -> list[int]:
+def _find_pids_by_cmdline(process_name: str, cmdline_substring: str) -> list[int]:
     ps_command = (
         f"Get-CimInstance Win32_Process -Filter \"Name='{process_name}'\" | "
         f"Where-Object {{ $_.CommandLine -like '*{cmdline_substring}*' }} | "
@@ -144,6 +159,48 @@ def _find_pids(process_name: str, cmdline_substring: str) -> list[int]:
     )
     result = run_powershell(ps_command)
     return [int(line.strip()) for line in result.stdout.splitlines() if line.strip().isdigit()]
+
+
+def _find_pids_by_project(process_name: str, project_dir_fragment: str) -> list[int]:
+    """Finds every PID in one project's process family: the venv's python.exe
+    (whose ExecutablePath contains the project's own folder name) plus any
+    child process it re-execs into (which reports the shared global
+    interpreter's path instead, so it's matched via the parent/child PID
+    chain rather than by path)."""
+    ps_command = (
+        f"Get-CimInstance Win32_Process -Filter \"Name='{process_name}'\" | "
+        "Select-Object ProcessId,ParentProcessId,ExecutablePath | "
+        "ForEach-Object { \"$($_.ProcessId),$($_.ParentProcessId),$($_.ExecutablePath)\" }"
+    )
+    result = run_powershell(ps_command)
+
+    rows: list[tuple[int, int, str]] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid_str, ppid_str, exe_path = line.split(",", 2)
+        rows.append((int(pid_str), int(ppid_str), exe_path))
+
+    fragment = f"\\{project_dir_fragment}\\venv\\".lower()
+    matched = {pid for pid, _ppid, exe in rows if exe and fragment in exe.lower()}
+
+    changed = True
+    while changed:
+        changed = False
+        for pid, ppid, _exe in rows:
+            if ppid in matched and pid not in matched:
+                matched.add(pid)
+                changed = True
+
+    return sorted(matched)
+
+
+def _find_pids(task_name: str) -> list[int]:
+    process_name, mode, match_value = _PROCESS_MATCH[task_name]
+    if mode == "project":
+        return _find_pids_by_project(process_name, match_value)
+    return _find_pids_by_cmdline(process_name, match_value)
 
 
 def _kill_pids(pids: list[int]) -> None:
@@ -157,12 +214,12 @@ def _kill_pids(pids: list[int]) -> None:
 
 
 def query_service_status(task_name: str) -> str:
-    pids = _find_pids(*_PROCESS_MATCH[task_name])
+    pids = _find_pids(task_name)
     return f"Running (PID {pids[0]})" if pids else "Stopped"
 
 
 def stop_task(task_name: str) -> str:
-    pids = _find_pids(*_PROCESS_MATCH[task_name])
+    pids = _find_pids(task_name)
     if not pids:
         return "Already stopped."
     _kill_pids(pids)
@@ -208,9 +265,10 @@ _psutil_procs: dict[int, psutil.Process] = {}
 
 def get_process_stats(task_name: str) -> dict | None:
     """Aggregates CPU/RAM across every matching PID (the venv's python.exe launcher
-    plus the real interpreter it spawns both match "bot.py" in their command line),
-    rather than trying to guess which single PID is the "real" one."""
-    pids = _find_pids(*_PROCESS_MATCH[task_name])
+    plus the real interpreter it spawns, both belonging to the same project's
+    process family — see _find_pids_by_project), rather than trying to guess
+    which single PID is the "real" one."""
+    pids = _find_pids(task_name)
     if not pids:
         return None
 
@@ -270,11 +328,11 @@ def describe_cookies() -> str:
 # --------------------------------------------------------------------------------
 
 
-def read_log_tail(max_bytes: int = 20_000) -> str:
-    if not LOG_PATH.exists():
-        return "(bot_output.log not found yet)\n"
-    size = LOG_PATH.stat().st_size
-    with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+def read_log_tail(log_path: Path = LOG_PATH, max_bytes: int = 20_000) -> str:
+    if not log_path.exists():
+        return f"({log_path.name} not found yet)\n"
+    size = log_path.stat().st_size
+    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
         if size > max_bytes:
             f.seek(size - max_bytes)
             f.readline()  # drop the partial first line
@@ -282,21 +340,22 @@ def read_log_tail(max_bytes: int = 20_000) -> str:
 
 
 class LogTailer(threading.Thread):
-    def __init__(self, out_queue: list):
+    def __init__(self, out_queue: list, log_path: Path = LOG_PATH):
         super().__init__(daemon=True)
         self.out_queue = out_queue
+        self.log_path = log_path
         self._stop_event = threading.Event()
-        self._pos = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
+        self._pos = log_path.stat().st_size if log_path.exists() else 0
 
     def run(self) -> None:
         while not self._stop_event.is_set():
             try:
-                if LOG_PATH.exists():
-                    size = LOG_PATH.stat().st_size
+                if self.log_path.exists():
+                    size = self.log_path.stat().st_size
                     if size < self._pos:
                         self._pos = 0  # log was rotated/truncated
                     if size > self._pos:
-                        with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                        with open(self.log_path, "r", encoding="utf-8", errors="replace") as f:
                             f.seek(self._pos)
                             new_text = f.read()
                             self._pos = f.tell()
@@ -478,9 +537,11 @@ class OverviewPage(ctk.CTkFrame):
         cards_row = ctk.CTkFrame(self, fg_color="transparent")
         cards_row.pack(fill="x")
         self.bot_card = ServiceCard(cards_row, app, "🎵  Music Bot", BOT_TASK_NAME)
-        self.bot_card.pack(side="left", expand=True, fill="both", padx=(0, 8))
+        self.bot_card.pack(side="left", expand=True, fill="both", padx=(0, 6))
         self.pot_card = ServiceCard(cards_row, app, "🔑  PO Token Provider", POTPROVIDER_TASK_NAME)
-        self.pot_card.pack(side="left", expand=True, fill="both", padx=(8, 0))
+        self.pot_card.pack(side="left", expand=True, fill="both", padx=6)
+        self.leaderboard_card = ServiceCard(cards_row, app, "🏆  Leaderboard Bot", LEADERBOARD_TASK_NAME)
+        self.leaderboard_card.pack(side="left", expand=True, fill="both", padx=(6, 0))
 
         ctk.CTkLabel(self, text="Quick Actions", font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(24, 8))
 
@@ -523,6 +584,7 @@ class OverviewPage(ctk.CTkFrame):
     def _auto_refresh(self) -> None:
         self.bot_card.refresh()
         self.pot_card.refresh()
+        self.leaderboard_card.refresh()
         self.app.after(2500, self._auto_refresh)
 
 
@@ -641,15 +703,28 @@ class DatabasePage(ctk.CTkFrame):
 
 
 class LogsPage(ctk.CTkFrame):
+    LOG_SOURCES = {
+        "🎵 Music Bot": LOG_PATH,
+        "🏆 Leaderboard Bot": LEADERBOARD_LOG_PATH,
+    }
+
     def __init__(self, master, app: "Dashboard"):
         super().__init__(master, fg_color="transparent")
         self.app = app
         self._queue: list[str] = []
+        self._tailer: LogTailer | None = None
 
         ctk.CTkLabel(self, text="Live Logs", font=("Segoe UI", 22, "bold")).pack(anchor="w", pady=(0, 12))
 
         button_row = ctk.CTkFrame(self, fg_color="transparent")
         button_row.pack(fill="x", pady=(0, 8))
+
+        self.source_selector = ctk.CTkSegmentedButton(
+            button_row, values=list(self.LOG_SOURCES), command=self._on_source_changed
+        )
+        self.source_selector.set(next(iter(self.LOG_SOURCES)))
+        self.source_selector.pack(side="left", padx=(0, 10))
+
         ctk.CTkButton(button_row, text="Clear view", width=100, command=self._clear).pack(side="left")
 
         self.textbox = ctk.CTkTextbox(
@@ -661,11 +736,23 @@ class LogsPage(ctk.CTkFrame):
         self.textbox.tag_config("success", foreground=SUCCESS)
         self.textbox.tag_config("default", foreground="#d0d0e0")
 
-        self._append(read_log_tail())
-
-        self._tailer = LogTailer(self._queue)
-        self._tailer.start()
+        self._switch_source(next(iter(self.LOG_SOURCES)))
         self._poll_queue()
+
+    def _on_source_changed(self, selected: str) -> None:
+        self._switch_source(selected)
+
+    def _switch_source(self, source_name: str) -> None:
+        if self._tailer is not None:
+            self._tailer.stop()
+        self._queue.clear()
+
+        log_path = self.LOG_SOURCES[source_name]
+        self._clear()
+        self._append(read_log_tail(log_path))
+
+        self._tailer = LogTailer(self._queue, log_path)
+        self._tailer.start()
 
     @staticmethod
     def _classify(line: str) -> str:
@@ -800,6 +887,7 @@ class SettingsPage(ctk.CTkFrame):
         def worker():
             set_self_heal_enabled(BOT_TASK_NAME, autoheal)
             set_self_heal_enabled(POTPROVIDER_TASK_NAME, autoheal)
+            set_self_heal_enabled(LEADERBOARD_TASK_NAME, autoheal)
 
         threading.Thread(target=worker, daemon=True).start()
         self.status_label.configure(
