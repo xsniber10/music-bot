@@ -109,7 +109,19 @@ else:
     )
 
 FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    # Discord voice playback consumes ffmpeg's output at real-time pace, unlike a plain
+    # file download — that throttles how fast ffmpeg reads from the network too (once
+    # its output pipe backpressures, the read loop stalls with it), leaving long idle
+    # gaps in the TCP connection to googlevideo.com. That idle/bursty pattern is what
+    # was tripping "-10054"/connection-reset errors mid-playback (confirmed: a plain,
+    # as-fast-as-possible fetch of the same URL never hit this, only real-time playback
+    # did). "-thread_queue_size" lets ffmpeg's input-reading thread buffer far ahead of
+    # real-time instead of pacing the network read to match playback, and the extra
+    # reconnect_* flags make recovery more robust for whatever gaps still happen.
+    "before_options": (
+        "-reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -reconnect_on_network_error 1 "
+        "-reconnect_delay_max 5 -thread_queue_size 4096"
+    ),
     "options": "-vn",
 }
 
