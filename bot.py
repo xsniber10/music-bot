@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+import traceback
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
@@ -349,7 +350,13 @@ async def save_song_to_library(song: Song) -> None:
         "duration": song.duration,
         "thumbnail": song.thumbnail,
     }
-    await db.upsert_library_entry(song.webpage_url, song.title, song.duration, song.thumbnail)
+    try:
+        await db.upsert_library_entry(song.webpage_url, song.title, song.duration, song.thumbnail)
+    except Exception as exc:  # noqa: BLE001 - a Supabase hiccup must never abort playback.
+        # playlist_data above is already updated in memory, so the dashboard/session still
+        # see this song immediately; only the durable copy is at risk, and it'll catch up
+        # next time this URL is saved (e.g. next time it's queued or played).
+        print(f"[library] Failed to persist '{song.title}' ({song.webpage_url}) to Supabase: {exc!r}")
 
 
 def load_library_into_session(state: GuildState, requester: discord.Member) -> int:
@@ -455,6 +462,24 @@ async def extract_song(query: str, requester: discord.Member) -> Song:
         requester=requester,
         http_headers=data.get("http_headers"),
     )
+
+
+async def extract_song_with_retry(query: str, requester: discord.Member, *, retries: int = 1) -> Song:
+    """extract_song, with one short retry on failure. Used by the autonomous queue-advance
+    path (start_track) rather than interactive commands: a one-off network blip resolving
+    a track (DNS hiccup, momentary connection drop — more likely for Spotify-originated
+    entries, which need an extra yt-dlp search step) shouldn't permanently drop an
+    otherwise-good track from the queue on the very first failed attempt."""
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return await extract_song(query, requester)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                print(f"[extract_song] Attempt {attempt + 1} failed for {query!r}: {exc!r} — retrying...")
+                await asyncio.sleep(1.5)
+    raise last_exc
 
 
 async def ensure_voice_connected(guild: discord.Guild, member: discord.Member) -> str | None:
@@ -813,52 +838,106 @@ async def start_track(guild: discord.Guild, channel: discord.abc.Messageable, in
     if vc is None or not vc.is_connected():
         return
 
-    song = state.session_songs[index]
-    # Always re-resolve immediately before playing, even if source_url was already
-    # populated (e.g. from playlist loading) — YouTube's PO-Token-authenticated stream
-    # URLs are short-lived, and a track resolved minutes ago (while earlier queue
-    # entries were still playing) can 403 by the time it's actually its turn.
-    placeholder_key = song.webpage_url
-    try:
-        resolved = await extract_song(song.webpage_url, song.requester)
-    except Exception as exc:
-        print(f"Failed to resolve queued song '{song.webpage_url}': {exc}")
-        del state.session_songs[index]
+    # Iterates rather than recurses through consecutive broken tracks (a bad Spotify
+    # resolution, a deleted video, a source that fails to start) so a long run of dead
+    # entries can't build unbounded call-stack depth, and so a single failure anywhere in
+    # this process always ends in either "playing something" or "cleanly idle" — never an
+    # uncaught exception that would silently kill the whole queue-advance chain (see
+    # after_playing/track_finished below, which is what actually drives this loop for
+    # autonomous track-to-track advances).
+    song: Song | None = None
+    while True:
         if not state.session_songs:
             state.current_index = -1
             stop_progress_task(state)
             await render_panel(guild, channel)
             return
-        next_index = index if index < len(state.session_songs) else 0
-        await start_track(guild, channel, next_index)
-        return
-    state.session_songs[index] = resolved
-    song = resolved
-    if resolved.webpage_url != placeholder_key and placeholder_key in playlist_data["library"]:
-        del playlist_data["library"][placeholder_key]
-        await db.delete_library_entry(placeholder_key)
-    await save_song_to_library(song)
+
+        index %= len(state.session_songs)
+        candidate = state.session_songs[index]
+        # Always re-resolve immediately before playing, even if source_url was already
+        # populated (e.g. from playlist loading) — YouTube's PO-Token-authenticated stream
+        # URLs are short-lived, and a track resolved minutes ago (while earlier queue
+        # entries were still playing) can 403 by the time it's actually its turn.
+        placeholder_key = candidate.webpage_url
+        try:
+            resolved = await extract_song_with_retry(candidate.webpage_url, candidate.requester)
+        except Exception as exc:
+            print(f"[playback] Failed to resolve queued song '{candidate.webpage_url}': {exc!r} — skipping it.")
+            del state.session_songs[index]
+            continue
+
+        state.session_songs[index] = resolved
+        song = resolved
+        if resolved.webpage_url != placeholder_key and placeholder_key in playlist_data["library"]:
+            del playlist_data["library"][placeholder_key]
+            try:
+                await db.delete_library_entry(placeholder_key)
+            except Exception as exc:  # noqa: BLE001 - stale-placeholder cleanup is best-effort
+                print(f"[library] Failed to delete stale placeholder '{placeholder_key}' from Supabase: {exc!r}")
+        await save_song_to_library(song)
+
+        try:
+            audio = discord.FFmpegPCMAudio(song.source_url, **build_ffmpeg_options(song.http_headers))
+            source = discord.PCMVolumeTransformer(audio, volume=state.volume)
+            vc.play(source, after=lambda error, url=song.webpage_url: _after_playing(error, guild, channel, url))
+        except Exception as exc:
+            print(f"[playback] Failed to start playback for '{song.webpage_url}': {exc!r} — skipping it.")
+            del state.session_songs[index]
+            continue
+
+        break
 
     stop_progress_task(state)
     state.current_index = index
     state.elapsed_offset = 0.0
     state.play_resumed_at = time.monotonic()
 
-    audio = discord.FFmpegPCMAudio(song.source_url, **build_ffmpeg_options(song.http_headers))
-    source = discord.PCMVolumeTransformer(audio, volume=state.volume)
+    try:
+        await render_panel(guild, channel)
+    except Exception as exc:  # noqa: BLE001 - a panel display glitch must never affect the
+        # audio that's already playing at this point (vc.play() above already succeeded).
+        print(f"[playback] Failed to render the panel after starting '{song.webpage_url}': {exc!r}")
 
-    def after_playing(error: Exception | None):
-        if error:
-            print(f"Player error: {error}")
-        asyncio.run_coroutine_threadsafe(track_finished(guild, channel), bot.loop)
-
-    vc.play(source, after=after_playing)
-
-    await render_panel(guild, channel)
     state.progress_task = bot.loop.create_task(progress_updater(guild))
 
 
+def _after_playing(
+    error: Exception | None, guild: discord.Guild, channel: discord.abc.Messageable, webpage_url: str
+) -> None:
+    """Called by discord.py's audio player thread (not the event loop thread) when a
+    track ends or its source errors out. asyncio.run_coroutine_threadsafe returns a
+    concurrent.futures.Future that nothing was previously checking — if track_finished (or
+    anything it calls) raised, that exception was captured in the Future and silently
+    discarded forever, which is how the bot could stop playing with zero log output. The
+    done-callback below at least makes that visible; track_finished's own try/except is
+    what actually keeps the queue advancing despite it."""
+    if error:
+        print(f"[playback] Player error for '{webpage_url}': {error!r}")
+
+    future = asyncio.run_coroutine_threadsafe(track_finished(guild, channel), bot.loop)
+
+    def _log_if_failed(fut: asyncio.Future) -> None:
+        exc = fut.exception()
+        if exc is not None:
+            print(f"[playback] track_finished crashed after '{webpage_url}': {exc!r}")
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
+
+    future.add_done_callback(_log_if_failed)
+
+
 async def track_finished(guild: discord.Guild, channel: discord.abc.Messageable) -> None:
+    try:
+        await _advance_queue(guild, channel)
+    except Exception as exc:  # noqa: BLE001 - this is the only thing driving the queue
+        # forward once a track ends; if anything here raises unexpectedly the bot must
+        # still try to recover instead of silently going idle forever.
+        print(f"[playback] Unexpected error advancing the queue: {exc!r}")
+        traceback.print_exc()
+        await _recover_after_failure(guild, channel)
+
+
+async def _advance_queue(guild: discord.Guild, channel: discord.abc.Messageable) -> None:
     state = get_state(guild.id)
 
     if state.manual_transition:
@@ -883,6 +962,30 @@ async def track_finished(guild: discord.Guild, channel: discord.abc.Messageable)
         next_index = 0
 
     await start_track(guild, channel, next_index)
+
+
+async def _recover_after_failure(guild: discord.Guild, channel: discord.abc.Messageable) -> None:
+    """Best-effort recovery when advancing the queue blew up somewhere other than a single
+    bad track (start_track already handles that on its own). Tries once to resume from
+    wherever the queue currently is; if even that fails, resets to a clean standby state
+    instead of leaving the bot connected but permanently stuck doing nothing."""
+    state = get_state(guild.id)
+    try:
+        vc = guild.voice_client
+        if vc is not None and vc.is_connected() and state.session_songs:
+            next_index = state.current_index + 1
+            if next_index >= len(state.session_songs):
+                next_index = 0
+            await start_track(guild, channel, next_index)
+            return
+    except Exception as exc:  # noqa: BLE001 - genuinely last resort
+        print(f"[playback] Recovery attempt also failed: {exc!r}")
+
+    stop_progress_task(state)
+    try:
+        await render_panel(guild, channel)
+    except Exception as exc:  # noqa: BLE001 - already in the failure path, nothing left to fall back to
+        print(f"[playback] Failed to render panel during recovery: {exc!r}")
 
 
 async def auto_disconnect(guild: discord.Guild) -> None:
