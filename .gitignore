@@ -5,3 +5,7 @@ playlists.json
 bot_output.log
 cookies.txt
 venv/
+*.exe
+*.spec
+build/
+potprovider_output.log
