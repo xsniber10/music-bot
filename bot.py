@@ -38,6 +38,22 @@ SPOTIFY_PLAYLIST_URL = os.getenv(
     "SPOTIFY_PLAYLIST_URL", "https://open.spotify.com/playlist/0IalEO1MniD8cDpAfj39jC?si=7114a6a5582d40ea"
 )
 
+# Every Spotify playlist seed_song_library() keeps mirrored to a named saved playlist,
+# so each shows up as its own selectable playlist in the dashboard's Music tab. Names
+# are lowercase to match !saveplaylist/!delplaylist's own naming convention (both
+# .lower() whatever name a user types) — a mismatched case here would let a user's
+# "!saveplaylist Lena" silently create an unrelated second row instead of touching the
+# one the sync pipeline actually maintains. Add more entries here to sync more
+# playlists; each just needs a Spotify playlist URL and the local name to sync it to.
+SPOTIFY_PLAYLIST_SYNCS = [
+    {"url": SPOTIFY_PLAYLIST_URL, "name": "spotify"},
+    {"url": "https://open.spotify.com/playlist/7GWju1noJD3Y8rERmlYrTw?si=9721cf8f09af489c", "name": "lena"},
+    {
+        "url": "https://open.spotify.com/playlist/0oljRPtVBIJnpn8RPhx7ae?si=6645d03d54984219&pt=0be96ca866d0e8dba713165c74ced35b",
+        "name": "dj",
+    },
+]
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
@@ -251,13 +267,67 @@ def fetch_spotify_playlist_tracks(playlist_url: str) -> list[dict]:
     return tracks
 
 
-async def fetch_spotify_playlist_tracks_async(playlist_url: str) -> list[dict]:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, fetch_spotify_playlist_tracks, playlist_url)
+def available_spotify_playlist_names() -> list[str]:
+    """The Spotify-sourced playlist names a user can pick from — one per configured
+    entry in SPOTIFY_PLAYLIST_SYNCS, in the order they're configured. Deliberately not
+    "every saved playlist in Supabase": "general" and anything else a user saved via
+    !saveplaylist isn't Spotify-sourced and shouldn't show up in a Spotify picker."""
+    return [sync["name"] for sync in SPOTIFY_PLAYLIST_SYNCS if sync["url"]]
+
+
+async def get_synced_playlist_tracks(name: str) -> list[dict]:
+    """Loads one Spotify-synced playlist's tracks fresh from Supabase (via the bot's
+    already-open pool — see db.load_all_data), rather than the in-memory playlist_data
+    snapshot, which could be stale relative to edits made through the dashboard's
+    Playlist Manager since this bot's last boot or last seed_song_library() run."""
+    data = await db.load_all_data()
+    library = data["library"]
+    urls = data["playlists"].get(name, [])
+    return [
+        {
+            "url": url,
+            "title": library.get(url, {}).get("title", url),
+            "duration": library.get(url, {}).get("duration"),
+        }
+        for url in urls
+    ]
+
+
+class SpotifyPlaylistPickerSelect(discord.ui.Select):
+    """Ephemeral picker shown by the "Switch to Spotify" button when more than one
+    Spotify playlist is configured, so the user explicitly chooses which one to load
+    instead of always getting a single hardcoded playlist."""
+
+    def __init__(self, names: list[str]):
+        options = [
+            discord.SelectOption(label=name.capitalize(), value=name, emoji="🟢") for name in names
+        ]
+        super().__init__(placeholder="Choose a Spotify playlist to load...", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        name = self.values[0]
+        guild = interaction.guild
+        state = get_state(guild.id)
+        channel = state.text_channel or interaction.channel
+        state.text_channel = channel
+
+        await interaction.response.edit_message(content=f"🟢 Loading **{name}**...", view=None)
+
+        state.spotify_view = True
+        state.spotify_playlist_name = name
+        state.spotify_tracks_cache = await get_synced_playlist_tracks(name)
+        await render_panel(guild, channel)
+
+
+class SpotifyPlaylistPickerView(discord.ui.View):
+    def __init__(self, names: list[str]):
+        super().__init__(timeout=60)
+        self.add_item(SpotifyPlaylistPickerSelect(names))
 
 
 async def seed_song_library() -> None:
     new_entries: list[tuple[str, str, int | None, str | None]] = []
+    synced_playlists: list[tuple[str, list[str]]] = []
 
     for entry in SONG_LIBRARY:
         url = entry.get("url")
@@ -269,9 +339,16 @@ async def seed_song_library() -> None:
         playlist_data["library"][url] = {"title": title, "duration": None, "thumbnail": None}
         new_entries.append((url, title, None, None))
 
-    if SPOTIFY_PLAYLIST_URL:
-        for track in fetch_spotify_playlist_tracks(SPOTIFY_PLAYLIST_URL):
+    for sync in SPOTIFY_PLAYLIST_SYNCS:
+        playlist_url = sync["url"]
+        playlist_name = sync["name"]
+        if not playlist_url:
+            continue
+
+        playlist_urls: list[str] = []
+        for track in fetch_spotify_playlist_tracks(playlist_url):
             url = track["url"]
+            playlist_urls.append(url)
             if url in playlist_data["library"]:
                 continue
             duration = track.get("duration")
@@ -282,8 +359,23 @@ async def seed_song_library() -> None:
             }
             new_entries.append((url, track["title"], duration, None))
 
+        if playlist_urls:
+            synced_playlists.append((playlist_name, playlist_urls))
+
     for url, title, duration, thumbnail in new_entries:
         await db.upsert_library_entry(url, title, duration, thumbnail)
+
+    # Keeps each configured playlist mirrored to its Spotify source on every boot
+    # (order included, matching Spotify's own track order) — so they're always up to
+    # date in the dashboard's Music tab. Note this means a reorder done there gets
+    # overwritten on the bot's next restart; these playlists are meant to reflect
+    # Spotify, not be independently curated.
+    for playlist_name, playlist_urls in synced_playlists:
+        playlist_data["playlists"][playlist_name] = playlist_urls
+        try:
+            await db.upsert_playlist(playlist_name, playlist_urls)
+        except Exception as exc:  # noqa: BLE001 - a Supabase hiccup here must not block startup
+            print(f"[library] Failed to sync the '{playlist_name}' playlist to Supabase: {exc!r}")
 
 
 class Song:
@@ -325,6 +417,7 @@ class GuildState:
         self.play_resumed_at: float | None = None
         self.spotify_view: bool = False
         self.spotify_tracks_cache: list[dict] | None = None
+        self.spotify_playlist_name: str | None = None
 
 
 guild_states: dict[int, GuildState] = {}
@@ -744,8 +837,13 @@ async def perform_skip(guild: discord.Guild, channel: discord.abc.Messageable) -
     state.manual_transition = True
     vc.stop()
 
-    await start_track(guild, channel, next_index)
-    return f"Skipped to **{state.session_songs[next_index].title}**."
+    result = await start_track(guild, channel, next_index)
+    if result is None:
+        return "The queue is now empty."
+    song, substituted = result
+    if substituted:
+        return f"⚠️ That track couldn't be loaded — skipped ahead to **{song.title}** instead."
+    return f"Skipped to **{song.title}**."
 
 
 async def perform_previous(guild: discord.Guild, channel: discord.abc.Messageable) -> str:
@@ -762,8 +860,13 @@ async def perform_previous(guild: discord.Guild, channel: discord.abc.Messageabl
     if vc.is_playing() or vc.is_paused():
         vc.stop()
 
-    await start_track(guild, channel, prev_index)
-    return f"⏮️ Back to **{state.session_songs[prev_index].title}**."
+    result = await start_track(guild, channel, prev_index)
+    if result is None:
+        return "The queue is now empty."
+    song, substituted = result
+    if substituted:
+        return f"⚠️ That track couldn't be loaded — playing **{song.title}** instead."
+    return f"⏮️ Back to **{song.title}**."
 
 
 async def perform_stop(guild: discord.Guild) -> str:
@@ -805,12 +908,18 @@ async def perform_jump(guild: discord.Guild, channel: discord.abc.Messageable, i
     if vc is None or not vc.is_connected():
         return "I'm not connected to a voice channel."
 
+    requested_title = state.session_songs[index].title
     state.manual_transition = True
     if vc.is_playing() or vc.is_paused():
         vc.stop()
 
-    await start_track(guild, channel, index)
-    return f"Now playing: **{state.session_songs[index].title}**."
+    result = await start_track(guild, channel, index)
+    if result is None:
+        return "The queue is now empty."
+    song, substituted = result
+    if substituted:
+        return f"⚠️ **{requested_title}** couldn't be loaded — playing **{song.title}** instead."
+    return f"Now playing: **{song.title}**."
 
 
 async def play_library_selection(
@@ -832,11 +941,25 @@ async def play_library_selection(
     return await perform_jump(guild, channel, new_index)
 
 
-async def start_track(guild: discord.Guild, channel: discord.abc.Messageable, index: int) -> None:
+async def start_track(
+    guild: discord.Guild, channel: discord.abc.Messageable, index: int
+) -> tuple[Song, bool] | None:
+    """Starts playback at `index` (wrapping/adjusting as songs get pruned — see below)
+    and reports back exactly what happened, rather than leaving the caller to guess by
+    re-reading state.session_songs[index] afterward. Returns (song, substituted): `song`
+    is whatever actually started playing, and `substituted` is True if the track
+    originally requested at `index` couldn't be resolved/started and this silently moved
+    on to the next playable one instead. Returns None if the queue is completely empty.
+
+    This return value matters: callers that build a user-facing "Now playing" / "Skipped
+    to" message MUST use it instead of indexing session_songs with their own
+    pre-computed index — that index can go stale mid-call (the loop below deletes broken
+    entries as it finds them), which previously produced messages naming the wrong song,
+    or an IndexError, while a *different* song was actually audible."""
     state = get_state(guild.id)
     vc = guild.voice_client
     if vc is None or not vc.is_connected():
-        return
+        return None
 
     # Iterates rather than recurses through consecutive broken tracks (a bad Spotify
     # resolution, a deleted video, a source that fails to start) so a long run of dead
@@ -846,12 +969,13 @@ async def start_track(guild: discord.Guild, channel: discord.abc.Messageable, in
     # after_playing/track_finished below, which is what actually drives this loop for
     # autonomous track-to-track advances).
     song: Song | None = None
+    substituted = False
     while True:
         if not state.session_songs:
             state.current_index = -1
             stop_progress_task(state)
             await render_panel(guild, channel)
-            return
+            return None
 
         index %= len(state.session_songs)
         candidate = state.session_songs[index]
@@ -865,6 +989,7 @@ async def start_track(guild: discord.Guild, channel: discord.abc.Messageable, in
         except Exception as exc:
             print(f"[playback] Failed to resolve queued song '{candidate.webpage_url}': {exc!r} — skipping it.")
             del state.session_songs[index]
+            substituted = True
             continue
 
         state.session_songs[index] = resolved
@@ -884,6 +1009,7 @@ async def start_track(guild: discord.Guild, channel: discord.abc.Messageable, in
         except Exception as exc:
             print(f"[playback] Failed to start playback for '{song.webpage_url}': {exc!r} — skipping it.")
             del state.session_songs[index]
+            substituted = True
             continue
 
         break
@@ -900,6 +1026,7 @@ async def start_track(guild: discord.Guild, channel: discord.abc.Messageable, in
         print(f"[playback] Failed to render the panel after starting '{song.webpage_url}': {exc!r}")
 
     state.progress_task = bot.loop.create_task(progress_updater(guild))
+    return song, substituted
 
 
 def _after_playing(
@@ -1333,13 +1460,14 @@ class SpotifySelect(discord.ui.Select):
         self.guild_id = guild_id
         state = get_state(guild_id)
         entries = (state.spotify_tracks_cache or [])[:25]
+        playlist_label = (state.spotify_playlist_name or "Spotify").capitalize()
 
         options = self.entries_to_options(entries) if entries else [
             discord.SelectOption(label="No Spotify tracks found", value="none", emoji="🟢")
         ]
 
         super().__init__(
-            placeholder="🟢 Spotify Playlist" if entries else "No Spotify tracks found",
+            placeholder=f"🟢 {playlist_label} Playlist" if entries else "No Spotify tracks found",
             options=options,
             disabled=not entries,
             min_values=1,
@@ -1589,20 +1717,35 @@ class MusicControlView(discord.ui.View):
         channel = state.text_channel or interaction.channel
         state.text_channel = channel
 
-        await interaction.response.defer()
-
         if state.spotify_view:
+            await interaction.response.defer()
             state.spotify_view = False
+            state.spotify_playlist_name = None
             state.spotify_tracks_cache = None
             await render_panel(guild)
             message = await channel.send("🔄 Switched back to normal view.")
             await message.delete(delay=5)
             return
 
-        tracks = await fetch_spotify_playlist_tracks_async(SPOTIFY_PLAYLIST_URL) if SPOTIFY_PLAYLIST_URL else []
-        state.spotify_view = True
-        state.spotify_tracks_cache = tracks
-        await render_panel(guild)
+        names = available_spotify_playlist_names()
+        if not names:
+            await interaction.response.send_message("No Spotify playlists are configured.", ephemeral=True)
+            return
+
+        if len(names) == 1:
+            # Nothing to choose between — skip the picker and load the one directly.
+            await interaction.response.defer()
+            state.spotify_view = True
+            state.spotify_playlist_name = names[0]
+            state.spotify_tracks_cache = await get_synced_playlist_tracks(names[0])
+            await render_panel(guild)
+            return
+
+        await interaction.response.send_message(
+            "🟢 Which Spotify playlist would you like to load?",
+            view=SpotifyPlaylistPickerView(names),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Prev", emoji="⏮️", style=discord.ButtonStyle.secondary, row=1)
     async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
