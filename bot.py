@@ -675,10 +675,15 @@ async def resolve_spotify_track_query(url: str) -> str | None:
 def build_now_playing_embed(state: GuildState, song: Song) -> discord.Embed:
     embed = discord.Embed(
         title=song.title,
-        url=song.webpage_url,
         description="🎶 Now Playing",
         color=discord.Color.blurple(),
     )
+    # Discord's embed.url rejects anything but http(s) — a song whose webpage_url is
+    # still an unresolved "ytsearch1:..." placeholder (not yet played once, so not yet
+    # swapped for a real YouTube URL by start_track) would otherwise 400 the whole
+    # panel render with "Scheme ... is not supported."
+    if song.webpage_url.startswith(("http://", "https://")):
+        embed.url = song.webpage_url
 
     elapsed = get_elapsed_seconds(state)
 
