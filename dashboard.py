@@ -14,6 +14,7 @@ sharing the bot's.
 
 import asyncio
 import hashlib
+import json
 import shutil
 import subprocess
 import threading
@@ -162,33 +163,56 @@ def _find_pids_by_cmdline(process_name: str, cmdline_substring: str) -> list[int
 
 
 def _find_pids_by_project(process_name: str, project_dir_fragment: str) -> list[int]:
-    """Finds every PID in one project's process family: the venv's python.exe
-    (whose ExecutablePath contains the project's own folder name) plus any
-    child process it re-execs into (which reports the shared global
-    interpreter's path instead, so it's matched via the parent/child PID
-    chain rather than by path)."""
+    """Finds every PID in one project's bot.py process family: the venv's python.exe
+    (whose ExecutablePath contains the project's own folder name, AND whose command
+    line runs "bot.py" specifically) plus any child process it re-execs into (which
+    reports the shared global interpreter's path instead, so it's matched via the
+    parent/child PID chain rather than by path).
+
+    The command-line check matters because this dashboard runs from the exact same
+    venv as the music bot (both under .../music-bot/venv/) — matching on venv path
+    alone would also catch the dashboard's own process, so a "Stop" on the bot could
+    kill the dashboard instead of (or in addition to) the actual bot.py process.
+
+    Uses ConvertTo-Json rather than hand-rolled delimited text: a process's own
+    CommandLine can itself contain embedded newlines (e.g. a "python -c "<multi-line
+    script>"" invocation), which breaks any parsing that assumes one process per
+    line. JSON properly escapes that instead of silently corrupting the row split."""
     ps_command = (
         f"Get-CimInstance Win32_Process -Filter \"Name='{process_name}'\" | "
-        "Select-Object ProcessId,ParentProcessId,ExecutablePath | "
-        "ForEach-Object { \"$($_.ProcessId),$($_.ParentProcessId),$($_.ExecutablePath)\" }"
+        "Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | "
+        "ConvertTo-Json -Compress"
     )
     result = run_powershell(ps_command)
 
-    rows: list[tuple[int, int, str]] = []
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        pid_str, ppid_str, exe_path = line.split(",", 2)
-        rows.append((int(pid_str), int(ppid_str), exe_path))
+    try:
+        parsed = json.loads(result.stdout) if result.stdout.strip() else []
+    except json.JSONDecodeError:
+        return []
+    if isinstance(parsed, dict):  # PowerShell unwraps single-element results to one object
+        parsed = [parsed]
+
+    rows: list[tuple[int, int, str, str]] = [
+        (
+            entry["ProcessId"],
+            entry["ParentProcessId"],
+            entry.get("ExecutablePath") or "",
+            entry.get("CommandLine") or "",
+        )
+        for entry in parsed
+    ]
 
     fragment = f"\\{project_dir_fragment}\\venv\\".lower()
-    matched = {pid for pid, _ppid, exe in rows if exe and fragment in exe.lower()}
+    matched = {
+        pid
+        for pid, _ppid, exe, cmdline in rows
+        if exe and fragment in exe.lower() and "bot.py" in cmdline.lower()
+    }
 
     changed = True
     while changed:
         changed = False
-        for pid, ppid, _exe in rows:
+        for pid, ppid, _exe, _cmdline in rows:
             if ppid in matched and pid not in matched:
                 matched.add(pid)
                 changed = True
