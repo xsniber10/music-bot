@@ -2167,15 +2167,33 @@ async def delplaylist(ctx: commands.Context, *, name: str):
 
 async def start_health_server() -> None:
     """Binds to $PORT so host platforms that require an open port (e.g. Render Web
-    Services) see a live listener, even though this bot has no real HTTP functionality."""
+    Services) see a live listener, even though this bot has no real HTTP functionality.
+
+    Locally, the 5-minute self-heal Scheduled Task trigger has no "only if not already
+    running" guard at the Windows Task Scheduler level — it can fire schtasks /run again
+    while a healthy instance is already up (e.g. overlapping with a manual restart from
+    the dashboard), briefly launching a second bot.py process. That second process would
+    hit this exact bind and get OSError: address already in use — and since nothing here
+    used to catch that, main() would propagate it uncaught and asyncio.run() would kill
+    the whole process instead of just skipping the (non-essential) health server. A
+    duplicate process crashing outright right as it's mid-login is exactly the kind of
+    "silent crash" that can leave voice playback in a bad state, so this is now
+    non-fatal: log it and keep going without the health server rather than dying."""
     port = int(os.getenv("PORT", "8080"))
-    app = web.Application()
-    app.router.add_get("/", lambda request: web.Response(text="OK"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"Health check server listening on port {port}.")
+    try:
+        app = web.Application()
+        app.router.add_get("/", lambda request: web.Response(text="OK"))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        print(f"Health check server listening on port {port}.")
+    except OSError as exc:
+        print(
+            f"[startup] Could not bind health check server to port {port} ({exc!r}) — "
+            "probably another instance of this bot is already running. Continuing "
+            "without it; this port isn't required for actual bot functionality."
+        )
 
 
 async def main() -> None:
