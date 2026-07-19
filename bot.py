@@ -7,6 +7,7 @@ import re
 import sys
 import time
 import urllib.request
+from urllib.parse import parse_qs, urlparse
 
 from aiohttp import web
 import discord
@@ -444,7 +445,21 @@ async def ensure_voice_connected(guild: discord.Guild, member: discord.Member) -
 
 
 def is_playlist_url(query: str) -> bool:
-    return query.startswith(("http://", "https://")) and "list=" in query
+    if not query.startswith(("http://", "https://")):
+        return False
+    parsed = urlparse(query)
+    params = parse_qs(parsed.query)
+    if "list" not in params:
+        return False
+    # A link to a specific video that happens to carry a "list=" param (e.g. shared
+    # while browsing a playlist) should just play that one video, matching
+    # YTDL_OPTIONS["noplaylist"] — only a bare playlist link (youtube.com/playlist?
+    # list=..., or a youtu.be link with no video in the path) should load the whole
+    # playlist.
+    if "v" in params:
+        return False
+    is_short_link_with_video = "youtu.be" in parsed.netloc and parsed.path.strip("/")
+    return not is_short_link_with_video
 
 
 async def extract_playlist_urls(url: str) -> list[str]:
