@@ -422,7 +422,17 @@ async def extract_song(query: str, requester: discord.Member) -> Song:
     )
 
     if "entries" in data:
-        data = data["entries"][0]
+        entries = list(data["entries"])
+        if len(entries) > 1:
+            # extract_song always returns exactly one Song regardless — this is purely
+            # diagnostic, to catch YTDL_OPTIONS["noplaylist"] not doing what we expect
+            # for some URL shape we haven't seen (see is_playlist_url for the actual
+            # single-vs-playlist routing decision, which is what normally prevents this).
+            print(
+                f"[extract_song] WARNING: query {query!r} resolved to {len(entries)} entries "
+                f"despite noplaylist=True; using only the first."
+            )
+        data = entries[0]
 
     return Song(
         source_url=data["url"],
@@ -1682,17 +1692,23 @@ async def play_query(
     state = get_state(guild.id)
     state.text_channel = channel
 
+    print(f"[play] {member}: received query {query!r}")
+
     if is_spotify_track_url(query):
         resolved_query = await resolve_spotify_track_query(query)
         if not resolved_query:
             message = await channel.send("Could not read that Spotify link. Try pasting the song name instead.")
             await message.delete(delay=5)
             return
+        print(f"[play] Resolved Spotify link to {resolved_query!r}")
         query = resolved_query
 
     if is_playlist_url(query):
+        print(f"[play] {query!r} classified as a playlist URL -> loading the full playlist")
         await handle_playlist_play(guild, channel, member, query)
         return
+
+    print(f"[play] {query!r} classified as a single track")
 
     voice_client = guild.voice_client
     shortcut_url = playlist_data["favorites"].get(query.strip().lower())
@@ -1765,6 +1781,8 @@ async def handle_playlist_play(
         await status_message.edit(content=f"Could not read that playlist: {exc}")
         await status_message.delete(delay=5)
         return
+
+    print(f"[playlist] {url!r} -> {len(urls)} video(s) found")
 
     if not urls:
         await status_message.edit(content="That playlist appears to be empty or unavailable.")
