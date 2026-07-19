@@ -12,8 +12,6 @@ sharing the bot's.
 """
 
 import asyncio
-import csv
-import io
 import subprocess
 import threading
 from pathlib import Path
@@ -28,6 +26,14 @@ LOG_PATH = BASE_DIR / "bot_output.log"
 
 BOT_TASK_NAME = "MusicDiscordBot"
 POTPROVIDER_TASK_NAME = "BgutilPotProvider"
+
+# (process name, command-line substring) used to find each service's real process,
+# since Task Scheduler no longer tracks it directly — see the comment above
+# query_service_status.
+_PROCESS_MATCH = {
+    BOT_TASK_NAME: ("python.exe", "bot.py"),
+    POTPROVIDER_TASK_NAME: ("node.exe", "main.js"),
+}
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -93,25 +99,53 @@ def run_schtasks(*args: str) -> subprocess.CompletedProcess:
     )
 
 
-def query_task_status(task_name: str) -> str:
-    result = run_schtasks("/query", "/tn", task_name, "/fo", "CSV", "/nh")
-    if result.returncode != 0:
-        return "Not found"
-    try:
-        row = next(csv.reader(io.StringIO(result.stdout)))
-        return row[-1]
-    except (StopIteration, IndexError):
-        return "Unknown"
-
-
 def start_task(task_name: str) -> str:
     result = run_schtasks("/run", "/tn", task_name)
     return result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
 
 
+# Both tasks launch their real process via a VBScript wrapper (WScript.Shell.Run with
+# window style 0) so no console window appears — but that means Task Scheduler only
+# tracks the short-lived wscript.exe launcher, not the detached process it starts, so
+# "schtasks /query" and "schtasks /end" no longer reflect or control the actual bot/
+# provider process. Status and stop/restart below check and kill the real process
+# directly instead.
+def _find_pids(process_name: str, cmdline_substring: str) -> list[int]:
+    ps_command = (
+        f"Get-CimInstance Win32_Process -Filter \"Name='{process_name}'\" | "
+        f"Where-Object {{ $_.CommandLine -like '*{cmdline_substring}*' }} | "
+        f"Select-Object -ExpandProperty ProcessId"
+    )
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", ps_command],
+        capture_output=True,
+        text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    return [int(line.strip()) for line in result.stdout.splitlines() if line.strip().isdigit()]
+
+
+def _kill_pids(pids: list[int]) -> None:
+    for pid in pids:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/F", "/T"],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+
+
+def query_service_status(task_name: str) -> str:
+    pids = _find_pids(*_PROCESS_MATCH[task_name])
+    return f"Running (PID {pids[0]})" if pids else "Stopped"
+
+
 def stop_task(task_name: str) -> str:
-    result = run_schtasks("/end", "/tn", task_name)
-    return result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
+    pids = _find_pids(*_PROCESS_MATCH[task_name])
+    if not pids:
+        return "Already stopped."
+    _kill_pids(pids)
+    return f"Stopped (killed PID {', '.join(map(str, pids))})."
 
 
 def restart_task(task_name: str) -> str:
@@ -391,7 +425,7 @@ class ServicesTab(ctk.CTkFrame):
 
     def _refresh_row(self, row: dict) -> None:
         def worker():
-            status = query_task_status(row["task_name"])
+            status = query_service_status(row["task_name"])
             self.app.after(0, lambda: row["status_label"].configure(text=f"Status: {status}"))
 
         threading.Thread(target=worker, daemon=True).start()
