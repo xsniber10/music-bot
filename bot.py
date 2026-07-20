@@ -535,6 +535,14 @@ async def extract_song(query: str, requester: discord.Member) -> Song:
 
     if "entries" in data:
         entries = list(data["entries"])
+        if not entries:
+            # A ytsearch1:<title> query (Spotify-sourced tracks are stored this way —
+            # see fetch_spotify_playlist_tracks) can legitimately turn up nothing: an
+            # unusual title (mixed scripts, stray punctuation like "|", a garbled
+            # artist suffix) that YouTube's search just doesn't match anything for.
+            # Without this check, entries[0] below raised a bare "list index out of
+            # range" with no indication of which query failed or why.
+            raise ValueError(f"No search results found for {query!r}")
         if len(entries) > 1:
             # extract_song always returns exactly one Song regardless — this is purely
             # diagnostic, to catch YTDL_OPTIONS["noplaylist"] not doing what we expect
