@@ -19,6 +19,7 @@ they're this bot's own admin surface rather than fleet-wide process control.
 import asyncio
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import threading
@@ -184,7 +185,8 @@ def fetch_leaderboard(env_path: Path) -> list[dict]:
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Supabase returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}") from exc
+        body_text = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(_missing_table_hint(body_text) or f"Supabase returned {exc.code}: {body_text}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach Supabase: {exc.reason}") from exc
 
@@ -222,7 +224,8 @@ def _patch_member_profile(env_path: Path, guild_id: int, user_id: int, fields: d
         with urllib.request.urlopen(request, timeout=10):
             pass
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Supabase returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}") from exc
+        body_text = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(_missing_table_hint(body_text) or f"Supabase returned {exc.code}: {body_text}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach Supabase: {exc.reason}") from exc
 
@@ -240,7 +243,8 @@ def adjust_member_xp(env_path: Path, guild_id: int, user_id: int, delta: int) ->
         with urllib.request.urlopen(request, timeout=10) as response:
             rows = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Supabase returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}") from exc
+        body_text = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(_missing_table_hint(body_text) or f"Supabase returned {exc.code}: {body_text}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach Supabase: {exc.reason}") from exc
 
@@ -465,6 +469,34 @@ def fetch_bot_guilds(env_path: Path) -> list[dict]:
 # --------------------------------------------------------------------------------
 
 
+def _missing_table_hint(error_body: str) -> str | None:
+    """PostgREST's "table not found in schema cache" error (code PGRST205 —
+    what you get if a table from bot.py's schema was never actually created
+    in this Supabase project, e.g. the setup SQL wasn't run yet) is a raw
+    JSON blob that's meaningless to anyone who isn't reading PostgREST's own
+    docs. Detects it and pulls the table name out, so callers can show an
+    actionable message instead. Returns None for any other error, which the
+    caller falls back to showing as-is.
+
+    Checked as a plain substring rather than requiring error_body to parse
+    as strict JSON first: PostgREST's real response is valid double-quoted
+    JSON, but by the time this string has been read from an HTTPError, wrapped
+    in another exception, and possibly re-displayed, there's no guarantee
+    something upstream hasn't already normalized the quoting — matching on
+    the PGRST205 code and a quote-agnostic table-name pattern is robust to
+    that either way, where a strict json.loads(...).get("code") check would
+    silently stop matching if the format ever drifts even slightly."""
+    if "PGRST205" not in error_body:
+        return None
+    match = re.search(r"public\.(\w+)", error_body)
+    table_name = match.group(1) if match else "one of the"
+    return (
+        f'The "{table_name}" table doesn\'t exist in this Supabase project yet. This is a one-time setup '
+        f"step, not a bug: run the SQL from oasis/bot.py's module docstring (SUPABASE_SCHEMA_SQL near the "
+        f"top of the file) once in your Supabase project's SQL Editor, then try again."
+    )
+
+
 def _supabase_request(env_path: Path, method: str, path: str, json_body=None, upsert: bool = False):
     """Generic PostgREST call, generalizing the GET/PATCH pattern
     fetch_leaderboard/_patch_member_profile use above into one place for
@@ -485,7 +517,9 @@ def _supabase_request(env_path: Path, method: str, path: str, json_body=None, up
             body = response.read()
             return json.loads(body) if body else None
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Supabase returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}") from exc
+        body_text = exc.read().decode("utf-8", errors="replace")
+        hint = _missing_table_hint(body_text)
+        raise RuntimeError(hint or f"Supabase returned {exc.code}: {body_text}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach Supabase: {exc.reason}") from exc
 
