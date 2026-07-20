@@ -27,7 +27,7 @@ import tkinter as tk
 import traceback
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox
 from urllib.parse import urlparse
@@ -392,6 +392,183 @@ def resolve_leaderboard_usernames(env_path: Path, rows: list[dict]) -> dict[tupl
     return names
 
 
+def _discord_api_request(env_path: Path, method: str, path: str, json_body: dict | None = None):
+    """Generalizes the GET-only pattern above (see _fetch_discord_guild_members)
+    to support writes — the first time dashboard.py has ever needed to WRITE
+    to Discord's API, needed for ticket-close (DELETE a channel). Same
+    Cloudflare-required User-Agent, same error handling."""
+    env = read_env_file(env_path)
+    token = env.get("DISCORD_TOKEN")
+    if not token:
+        raise RuntimeError(f"DISCORD_TOKEN not set in {env_path}")
+
+    headers = {
+        "Authorization": f"Bot {token}",
+        "User-Agent": "DiscordBot (https://github.com/discord/discord-api-docs, 1.0) BotCoreManagementSystem",
+    }
+    data = None
+    if json_body is not None:
+        data = json.dumps(json_body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = urllib.request.Request(f"{DISCORD_API_BASE}{path}", data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = response.read()
+            return json.loads(body) if body else None
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Discord returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach Discord: {exc.reason}") from exc
+
+
+_guild_list_cache: dict[Path, list[dict]] = {}
+_guild_list_cache_lock = threading.Lock()
+
+
+def fetch_bot_guilds(env_path: Path) -> list[dict]:
+    """GET /users/@me/guilds — every guild this bot token is currently a
+    member of. Used to populate the guild picker on the Shop/Tickets/Welcome/
+    Social Feeds tabs.
+
+    Cached per env_path for the life of the process: all four of those tabs
+    are constructed together in Dashboard.__init__ and each independently
+    calls this on load, which without caching means up to 4 near-simultaneous
+    identical Discord API calls on the same bot token every time the
+    dashboard launches — confirmed during testing to be enough to trip
+    Discord's rate limit (HTTP 429) on its own. Guild membership essentially
+    never changes within one dashboard session, so there's nothing to
+    invalidate this cache for.
+
+    The lock is held across the network call itself, not just the cache
+    read/write — a plain "check then fetch then store" without it still lets
+    all 4 background threads see an empty cache and all fire their own
+    request before any of them finishes (confirmed: that's exactly what
+    still 429'd even with the dict alone). Holding the lock serializes them:
+    the first thread in actually fetches, the other three block until it's
+    done and then just read the now-populated cache."""
+    with _guild_list_cache_lock:
+        if env_path in _guild_list_cache:
+            return _guild_list_cache[env_path]
+        guilds = _discord_api_request(env_path, "GET", "/users/@me/guilds") or []
+        _guild_list_cache[env_path] = guilds
+        return guilds
+
+
+# --------------------------------------------------------------------------------
+# Shop / Tickets / Welcome / Social Feeds config (Supabase)
+#
+# All five tables (guild_config, shop_items, shop_purchases, tickets,
+# social_feeds) are administered exclusively from the tabs below — bot.py
+# only ever reads them (see oasis/bot.py's own matching section) and inserts
+# the rows that a live Discord action produces (a purchase, a new ticket).
+# --------------------------------------------------------------------------------
+
+
+def _supabase_request(env_path: Path, method: str, path: str, json_body=None, upsert: bool = False):
+    """Generic PostgREST call, generalizing the GET/PATCH pattern
+    fetch_leaderboard/_patch_member_profile use above into one place for
+    every table's CRUD below, instead of re-deriving the same urllib/error
+    boilerplate a dozen more times. `path` is everything after `/rest/v1/`,
+    e.g. "guild_config?guild_id=eq.123". Returns the parsed JSON body, or
+    None for an empty response."""
+    url, key = _leaderboard_supabase_credentials(env_path)
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    data = None
+    if json_body is not None:
+        data = json.dumps(json_body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+        headers["Prefer"] = "return=representation" + (",resolution=merge-duplicates" if upsert else "")
+    request = urllib.request.Request(f"{url}/rest/v1/{path}", data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = response.read()
+            return json.loads(body) if body else None
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Supabase returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach Supabase: {exc.reason}") from exc
+
+
+DEFAULT_GUILD_CONFIG = {
+    "welcome_channel_id": None,
+    "welcome_message": None,
+    "verified_role_id": None,
+    "ticket_channel_id": None,
+    "ticket_staff_role_id": None,
+    "ticket_category_id": None,
+    "shop_channel_id": None,
+}
+
+
+def fetch_guild_config(env_path: Path, guild_id: int) -> dict:
+    rows = _supabase_request(env_path, "GET", f"guild_config?guild_id=eq.{guild_id}")
+    if rows:
+        return rows[0]
+    return {"guild_id": guild_id, **DEFAULT_GUILD_CONFIG}
+
+
+def save_guild_config(env_path: Path, guild_id: int, fields: dict) -> None:
+    """Upserts against the guild_id primary key — works whether or not a row
+    already exists for this guild, so callers never need to check first."""
+    _supabase_request(env_path, "POST", "guild_config?on_conflict=guild_id", json_body={"guild_id": guild_id, **fields}, upsert=True)
+
+
+def list_shop_items(env_path: Path, guild_id: int) -> list[dict]:
+    return _supabase_request(env_path, "GET", f"shop_items?guild_id=eq.{guild_id}&order=xp_cost.asc") or []
+
+
+def add_shop_item(env_path: Path, guild_id: int, role_id: int, xp_cost: int, label: str) -> None:
+    _supabase_request(
+        env_path, "POST", "shop_items",
+        json_body={"guild_id": guild_id, "role_id": role_id, "xp_cost": xp_cost, "label": label},
+    )
+
+
+def delete_shop_item(env_path: Path, item_id: int) -> None:
+    _supabase_request(env_path, "DELETE", f"shop_items?id=eq.{item_id}")
+
+
+def list_open_tickets(env_path: Path, guild_id: int) -> list[dict]:
+    return _supabase_request(env_path, "GET", f"tickets?guild_id=eq.{guild_id}&status=eq.open&order=created_at.desc") or []
+
+
+def close_ticket_record(env_path: Path, ticket_id: int) -> None:
+    """Marks the Supabase row closed — the caller is responsible for actually
+    deleting the Discord channel first via _discord_api_request, so a channel
+    that fails to delete doesn't get silently marked closed anyway."""
+    _supabase_request(
+        env_path, "PATCH", f"tickets?id=eq.{ticket_id}",
+        json_body={"status": "closed", "closed_at": datetime.now(timezone.utc).isoformat()},
+    )
+
+
+def list_social_feeds(env_path: Path, guild_id: int) -> list[dict]:
+    return _supabase_request(env_path, "GET", f"social_feeds?guild_id=eq.{guild_id}&order=created_at.desc") or []
+
+
+def add_social_feed(env_path: Path, guild_id: int, handle: str, channel_id: int, ping_style: str) -> None:
+    _supabase_request(
+        env_path, "POST", "social_feeds",
+        json_body={
+            "guild_id": guild_id,
+            "platform": "tiktok",
+            "handle": handle,
+            "channel_id": channel_id,
+            "ping_style": ping_style,
+            "enabled": True,
+        },
+    )
+
+
+def delete_social_feed(env_path: Path, feed_id: int) -> None:
+    _supabase_request(env_path, "DELETE", f"social_feeds?id=eq.{feed_id}")
+
+
+def set_social_feed_enabled(env_path: Path, feed_id: int, enabled: bool) -> None:
+    _supabase_request(env_path, "PATCH", f"social_feeds?id=eq.{feed_id}", json_body={"enabled": enabled})
+
+
 # --------------------------------------------------------------------------------
 # Cache / cookies maintenance (Music Bot specific)
 # --------------------------------------------------------------------------------
@@ -732,6 +909,61 @@ def make_page_header(parent, title: str, subtitle: str | None = None) -> None:
     ctk.CTkLabel(header, text=title, font=("Segoe UI", 24, "bold")).pack(anchor="w")
     if subtitle:
         ctk.CTkLabel(header, text=subtitle, font=("Segoe UI", 12), text_color=MUTED).pack(anchor="w", pady=(2, 0))
+
+
+def add_guild_picker(parent, app: "Dashboard", bot_id: str, status_label: ctk.CTkLabel, on_change) -> ctk.CTkOptionMenu:
+    """Shared "which server is this tab configuring" dropdown, reused by the
+    Shop/Tickets/Welcome/Social Feeds tabs — all four need a guild_id before
+    they can read/write anything. Always a real dropdown, even when the bot
+    is only in one server (the expected common case): simpler than a
+    separate hide/show code path, and it doubles as a "this is the server
+    you're configuring" label either way. Fetches the bot's guild list once
+    in the background (see fetch_bot_guilds); on_change(env_path, guild_id)
+    fires once the list loads, and again on every manual selection change."""
+    picker = ctk.CTkOptionMenu(parent, values=["Loading..."], state="disabled", width=240)
+    state = {"env_path": None, "guilds_by_name": {}}
+
+    def _select(name: str) -> None:
+        guild_id = state["guilds_by_name"].get(name)
+        if guild_id is not None and state["env_path"] is not None:
+            on_change(state["env_path"], guild_id)
+
+    picker.configure(command=_select)
+
+    def _on_loaded(env_path: Path, guilds: list[dict]) -> None:
+        if not guilds:
+            status_label.configure(text="⚠️ This bot isn't in any Discord servers.", text_color=ERROR)
+            return
+        state["env_path"] = env_path
+        state["guilds_by_name"] = {g["name"]: int(g["id"]) for g in guilds}
+        names = list(state["guilds_by_name"].keys())
+        picker.configure(values=names, state="normal" if len(names) > 1 else "disabled")
+        picker.set(names[0])
+        _select(names[0])
+
+    def worker():
+        try:
+            bot = next((b for b in app.bots if b.id == bot_id), None)
+            if bot is None:
+                raise RuntimeError(f'No registered bot with id "{bot_id}" — check bots_config.json.')
+            env_path = bot.directory / ".env"
+            guilds = fetch_bot_guilds(env_path)
+        except Exception as exc:  # noqa: BLE001 - surfacing any fetch error to the UI
+            error = exc
+            app.after(0, lambda: status_label.configure(text=f"⚠️ {error}", text_color=ERROR))
+            return
+        app.after(0, lambda: _on_loaded(env_path, guilds))
+
+    # Deferred (same reason as every other page's initial fetch, e.g.
+    # LeaderboardViewerPage's self.after(150, self.refresh)): all four of
+    # Shop/Tickets/Welcome/Social Feeds are constructed here inside
+    # Dashboard.__init__, before Dashboard.mainloop() has started pumping
+    # events. A worker thread started immediately can finish and call
+    # app.after(...) before that loop exists, which raises "main thread is
+    # not in main loop" and silently drops the callback — confirmed during
+    # testing. 150ms reliably gives mainloop() time to start first.
+    picker.after(150, lambda: threading.Thread(target=worker, daemon=True).start())
+    return picker
 
 
 class ConfirmRemoveBotDialog(ctk.CTkToplevel):
@@ -2183,6 +2415,774 @@ class AuditLogPage(ctk.CTkFrame):
 
 
 # --------------------------------------------------------------------------------
+# Shop Management page
+# --------------------------------------------------------------------------------
+
+
+class ShopManagementPage(ctk.CTkFrame):
+    """Create/edit/delete XP-Shop items (a Discord role + an XP price) and
+    set which channel hosts the buy panel. oasis/bot.py's ShopView reads
+    shop_items/guild_config directly and re-syncs its live panel every
+    CONFIG_REFRESH_INTERVAL_MINUTES, so a save here shows up in Discord
+    automatically without a bot restart."""
+
+    BOT_ID = "leaderboard_bot"
+
+    def __init__(self, master, app: "Dashboard"):
+        super().__init__(master, fg_color="transparent")
+        self.app = app
+        self.env_path: Path | None = None
+        self.guild_id: int | None = None
+
+        header_row = ctk.CTkFrame(self, fg_color="transparent")
+        header_row.pack(fill="x", pady=(0, 20))
+        title_col = ctk.CTkFrame(header_row, fg_color="transparent")
+        title_col.pack(side="left")
+        ctk.CTkLabel(title_col, text="🛒  Shop Management", font=("Segoe UI", 24, "bold")).pack(anchor="w")
+        ctk.CTkLabel(
+            title_col, text="Roles members can buy with XP", font=("Segoe UI", 12), text_color=MUTED
+        ).pack(anchor="w", pady=(2, 0))
+
+        self.status_label = ctk.CTkLabel(self, text="", font=("Segoe UI", 12))
+        self.status_label.pack(anchor="w", pady=(0, 14))
+
+        self.guild_picker = add_guild_picker(header_row, app, self.BOT_ID, self.status_label, self._on_guild_changed)
+        self.guild_picker.pack(side="right", anchor="e")
+
+        # --- Panel Settings ---
+        settings_card = ctk.CTkFrame(self, corner_radius=14, fg_color=CARD_BG)
+        settings_card.pack(fill="x", pady=(0, 12))
+        ctk.CTkLabel(settings_card, text="Panel Channel", font=("Segoe UI", 14, "bold")).pack(
+            anchor="w", padx=16, pady=(14, 6)
+        )
+        settings_row = ctk.CTkFrame(settings_card, fg_color="transparent")
+        settings_row.pack(fill="x", padx=16, pady=(0, 14))
+        self.channel_entry = ctk.CTkEntry(settings_row, placeholder_text="Shop Channel ID", width=220)
+        self.channel_entry.pack(side="left", padx=(0, 8))
+        self.save_channel_btn = ctk.CTkButton(
+            settings_row, text="💾  Save", width=90, fg_color=ACCENT, hover_color=ACCENT_HOVER, command=self._save_channel
+        )
+        self.save_channel_btn.pack(side="left")
+        add_tooltip(self.channel_entry, "The bot posts/updates the Buy panel in this channel")
+
+        # --- Add Item ---
+        add_card = ctk.CTkFrame(self, corner_radius=14, fg_color=CARD_BG)
+        add_card.pack(fill="x", pady=(0, 12))
+        ctk.CTkLabel(add_card, text="Add Item", font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=16, pady=(14, 6))
+        add_row = ctk.CTkFrame(add_card, fg_color="transparent")
+        add_row.pack(fill="x", padx=16, pady=(0, 14))
+        self.role_entry = ctk.CTkEntry(add_row, placeholder_text="Role ID", width=140)
+        self.role_entry.pack(side="left", padx=(0, 8))
+        self.label_entry = ctk.CTkEntry(add_row, placeholder_text="Label (e.g. VIP)", width=160)
+        self.label_entry.pack(side="left", padx=(0, 8))
+        self.cost_entry = ctk.CTkEntry(add_row, placeholder_text="XP Cost", width=100)
+        self.cost_entry.pack(side="left", padx=(0, 8))
+        self.add_item_btn = ctk.CTkButton(
+            add_row, text="+  Add Item", fg_color=SUCCESS, hover_color="#3ecf68", text_color="#0e0e16",
+            command=self._add_item,
+        )
+        self.add_item_btn.pack(side="left")
+
+        # --- Item list ---
+        list_card = ctk.CTkFrame(self, corner_radius=16, fg_color=CARD_BG, border_width=1, border_color=BORDER)
+        list_card.pack(fill="both", expand=True)
+        self.rows_frame = ctk.CTkScrollableFrame(
+            list_card, fg_color="transparent", scrollbar_button_color=BORDER, scrollbar_button_hover_color=ACCENT
+        )
+        self.rows_frame.pack(fill="both", expand=True, padx=16, pady=16)
+
+    def _on_guild_changed(self, env_path: Path, guild_id: int) -> None:
+        self.env_path = env_path
+        self.guild_id = guild_id
+        self.refresh()
+
+    def refresh(self) -> None:
+        if self.env_path is None or self.guild_id is None:
+            return
+        env_path, guild_id = self.env_path, self.guild_id
+        self.status_label.configure(text="Loading...", text_color=MUTED)
+
+        def worker():
+            try:
+                config = fetch_guild_config(env_path, guild_id)
+                items = list_shop_items(env_path, guild_id)
+            except Exception as exc:  # noqa: BLE001 - surfacing any fetch error to the UI
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+            self.app.after(0, lambda: self._on_loaded(config, items))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_loaded(self, config: dict, items: list[dict]) -> None:
+        self.channel_entry.delete(0, "end")
+        if config.get("shop_channel_id"):
+            self.channel_entry.insert(0, str(config["shop_channel_id"]))
+
+        for child in self.rows_frame.winfo_children():
+            child.destroy()
+
+        if not items:
+            placeholder = ctk.CTkFrame(self.rows_frame, corner_radius=PREMIUM_CARD_RADIUS, fg_color=ROW_BG)
+            placeholder.pack(fill="x", pady=6)
+            ctk.CTkLabel(placeholder, text="No items yet — add one above.", text_color=MUTED).pack(padx=18, pady=18)
+        else:
+            for item in items:
+                row = ctk.CTkFrame(self.rows_frame, corner_radius=PREMIUM_CARD_RADIUS, fg_color=ROW_BG)
+                row.pack(fill="x", pady=5, ipady=4)
+                text_col = ctk.CTkFrame(row, fg_color="transparent")
+                text_col.pack(side="left", fill="x", expand=True, padx=(16, 8), pady=8)
+                ctk.CTkLabel(text_col, text=item["label"], anchor="w", font=("Segoe UI", 13, "bold")).pack(anchor="w")
+                role_text = "Role ID ••••••" if self.app.streamer_mode else f"Role ID {item['role_id']}"
+                ctk.CTkLabel(text_col, text=role_text, anchor="w", font=("Segoe UI", 10), text_color=MUTED).pack(
+                    anchor="w"
+                )
+                ctk.CTkLabel(
+                    row, text=f"{item['xp_cost']:,} XP", font=("Segoe UI", 13, "bold"), text_color=ACCENT
+                ).pack(side="right", padx=(0, 12))
+                ctk.CTkButton(
+                    row, text="🗑", width=32, height=28, corner_radius=8, fg_color="transparent", border_width=1,
+                    border_color=ERROR, text_color=ERROR, hover_color=DANGER_HOVER,
+                    command=lambda i=item: self._delete_item(i),
+                ).pack(side="right", padx=(0, 8))
+
+        self.status_label.configure(text=f"✅ {len(items)} item(s).", text_color=SUCCESS)
+
+    def _save_channel(self) -> None:
+        if self.env_path is None or self.guild_id is None:
+            return
+        raw = self.channel_entry.get().strip()
+        if raw and not raw.isdigit():
+            self.status_label.configure(text="Channel ID must be a number.", text_color=ERROR)
+            return
+        env_path, guild_id = self.env_path, self.guild_id
+        channel_id = int(raw) if raw else None
+        self.status_label.configure(text="Saving...", text_color=MUTED)
+
+        def worker():
+            try:
+                save_guild_config(env_path, guild_id, {"shop_channel_id": channel_id})
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+            self.app.after(
+                0, lambda: self.status_label.configure(text="✅ Saved — the bot will pick this up within a couple minutes.", text_color=SUCCESS)
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _add_item(self) -> None:
+        if self.env_path is None or self.guild_id is None:
+            return
+        role_raw = self.role_entry.get().strip()
+        label = self.label_entry.get().strip()
+        cost_raw = self.cost_entry.get().strip()
+        if not role_raw.isdigit():
+            self.status_label.configure(text="Enter a valid Role ID.", text_color=ERROR)
+            return
+        if not label:
+            self.status_label.configure(text="Enter a label for the item.", text_color=ERROR)
+            return
+        if not cost_raw.isdigit() or int(cost_raw) <= 0:
+            self.status_label.configure(text="XP Cost must be a positive whole number.", text_color=ERROR)
+            return
+
+        env_path, guild_id = self.env_path, self.guild_id
+        role_id, xp_cost = int(role_raw), int(cost_raw)
+        self.status_label.configure(text="Adding...", text_color=MUTED)
+
+        def worker():
+            try:
+                add_shop_item(env_path, guild_id, role_id, xp_cost, label)
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+            self.app.after(0, self._on_item_added)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_item_added(self) -> None:
+        self.role_entry.delete(0, "end")
+        self.label_entry.delete(0, "end")
+        self.cost_entry.delete(0, "end")
+        self.refresh()
+
+    def _delete_item(self, item: dict) -> None:
+        if self.env_path is None:
+            return
+        if not messagebox.askyesno("Delete Item?", f"Delete \"{item['label']}\" from the shop?"):
+            return
+        env_path = self.env_path
+        self.status_label.configure(text="Deleting...", text_color=MUTED)
+
+        def worker():
+            try:
+                delete_shop_item(env_path, item["id"])
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+            self.app.after(0, self.refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_streamer_mode(self, _enabled: bool) -> None:
+        self.refresh()
+
+
+# --------------------------------------------------------------------------------
+# Support Tickets page
+# --------------------------------------------------------------------------------
+
+
+class TicketsPage(ctk.CTkFrame):
+    """Configure the ticket-open panel's channel + staff role, and close open
+    tickets — closing here DELETEs the real Discord channel via the REST API
+    (see _discord_api_request) and marks the Supabase row closed; there's no
+    in-Discord close button by design, this is the only place to close one."""
+
+    BOT_ID = "leaderboard_bot"
+
+    def __init__(self, master, app: "Dashboard"):
+        super().__init__(master, fg_color="transparent")
+        self.app = app
+        self.env_path: Path | None = None
+        self.guild_id: int | None = None
+
+        header_row = ctk.CTkFrame(self, fg_color="transparent")
+        header_row.pack(fill="x", pady=(0, 20))
+        title_col = ctk.CTkFrame(header_row, fg_color="transparent")
+        title_col.pack(side="left")
+        ctk.CTkLabel(title_col, text="🎫  Support Tickets", font=("Segoe UI", 24, "bold")).pack(anchor="w")
+        ctk.CTkLabel(
+            title_col, text="Open private-channel tickets, closed from here", font=("Segoe UI", 12), text_color=MUTED
+        ).pack(anchor="w", pady=(2, 0))
+
+        self.status_label = ctk.CTkLabel(self, text="", font=("Segoe UI", 12))
+        self.status_label.pack(anchor="w", pady=(0, 14))
+
+        self.guild_picker = add_guild_picker(header_row, app, self.BOT_ID, self.status_label, self._on_guild_changed)
+        self.guild_picker.pack(side="right", anchor="e")
+
+        # --- Panel Settings ---
+        settings_card = ctk.CTkFrame(self, corner_radius=14, fg_color=CARD_BG)
+        settings_card.pack(fill="x", pady=(0, 12))
+        ctk.CTkLabel(settings_card, text="Panel Settings", font=("Segoe UI", 14, "bold")).pack(
+            anchor="w", padx=16, pady=(14, 6)
+        )
+        settings_row = ctk.CTkFrame(settings_card, fg_color="transparent")
+        settings_row.pack(fill="x", padx=16, pady=(0, 14))
+        self.channel_entry = ctk.CTkEntry(settings_row, placeholder_text="Ticket Panel Channel ID", width=200)
+        self.channel_entry.pack(side="left", padx=(0, 8))
+        self.staff_role_entry = ctk.CTkEntry(settings_row, placeholder_text="Staff Role ID", width=160)
+        self.staff_role_entry.pack(side="left", padx=(0, 8))
+        self.save_settings_btn = ctk.CTkButton(
+            settings_row, text="💾  Save", width=90, fg_color=ACCENT, hover_color=ACCENT_HOVER, command=self._save_settings
+        )
+        self.save_settings_btn.pack(side="left")
+        add_tooltip(self.staff_role_entry, "Every ticket channel is created private to just the opener + this role")
+
+        # --- Open ticket list ---
+        list_card = ctk.CTkFrame(self, corner_radius=16, fg_color=CARD_BG, border_width=1, border_color=BORDER)
+        list_card.pack(fill="both", expand=True)
+        self.rows_frame = ctk.CTkScrollableFrame(
+            list_card, fg_color="transparent", scrollbar_button_color=BORDER, scrollbar_button_hover_color=ACCENT
+        )
+        self.rows_frame.pack(fill="both", expand=True, padx=16, pady=16)
+
+    def _on_guild_changed(self, env_path: Path, guild_id: int) -> None:
+        self.env_path = env_path
+        self.guild_id = guild_id
+        self.refresh()
+
+    def refresh(self) -> None:
+        if self.env_path is None or self.guild_id is None:
+            return
+        env_path, guild_id = self.env_path, self.guild_id
+        self.status_label.configure(text="Loading...", text_color=MUTED)
+
+        def worker():
+            try:
+                config = fetch_guild_config(env_path, guild_id)
+                tickets = list_open_tickets(env_path, guild_id)
+            except Exception as exc:  # noqa: BLE001 - surfacing any fetch error to the UI
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+
+            # Best-effort username resolution — same "still render with raw
+            # IDs rather than fail the whole page" approach as the Leaderboard
+            # tab, since it's a secondary lookup, not the primary data.
+            names: dict[int, str] = {}
+            try:
+                token = read_env_file(env_path).get("DISCORD_TOKEN")
+                if token:
+                    names = _fetch_discord_guild_members(token, guild_id)
+            except Exception:  # noqa: BLE001
+                pass
+
+            self.app.after(0, lambda: self._on_loaded(config, tickets, names))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_loaded(self, config: dict, tickets: list[dict], names: dict[int, str]) -> None:
+        self.channel_entry.delete(0, "end")
+        if config.get("ticket_channel_id"):
+            self.channel_entry.insert(0, str(config["ticket_channel_id"]))
+        self.staff_role_entry.delete(0, "end")
+        if config.get("ticket_staff_role_id"):
+            self.staff_role_entry.insert(0, str(config["ticket_staff_role_id"]))
+
+        for child in self.rows_frame.winfo_children():
+            child.destroy()
+
+        if not tickets:
+            placeholder = ctk.CTkFrame(self.rows_frame, corner_radius=PREMIUM_CARD_RADIUS, fg_color=ROW_BG)
+            placeholder.pack(fill="x", pady=6)
+            ctk.CTkLabel(placeholder, text="No open tickets.", text_color=MUTED).pack(padx=18, pady=18)
+        else:
+            for ticket in tickets:
+                fallback_name = f"User {ticket['opener_user_id']}"
+                opener_name = names.get(ticket["opener_user_id"], fallback_name)
+                if self.app.streamer_mode and opener_name == fallback_name:
+                    opener_name = "User ••••••"
+                channel_text = "#••••••" if self.app.streamer_mode else f"#{ticket['channel_id']}"
+                row = ctk.CTkFrame(self.rows_frame, corner_radius=PREMIUM_CARD_RADIUS, fg_color=ROW_BG)
+                row.pack(fill="x", pady=5, ipady=4)
+                text_col = ctk.CTkFrame(row, fg_color="transparent")
+                text_col.pack(side="left", fill="x", expand=True, padx=(16, 8), pady=8)
+                ctk.CTkLabel(text_col, text=channel_text, anchor="w", font=("Segoe UI", 13, "bold")).pack(anchor="w")
+                ctk.CTkLabel(
+                    text_col, text=f"Opened by {opener_name}", anchor="w", font=("Segoe UI", 10), text_color=MUTED
+                ).pack(anchor="w")
+                ctk.CTkButton(
+                    row, text="Close", width=80, height=28, corner_radius=8, fg_color="transparent", border_width=1,
+                    border_color=ERROR, text_color=ERROR, hover_color=DANGER_HOVER,
+                    command=lambda t=ticket: self._close_ticket(t),
+                ).pack(side="right", padx=(0, 12))
+
+        self.status_label.configure(text=f"✅ {len(tickets)} open ticket(s).", text_color=SUCCESS)
+
+    def _save_settings(self) -> None:
+        if self.env_path is None or self.guild_id is None:
+            return
+        channel_raw = self.channel_entry.get().strip()
+        role_raw = self.staff_role_entry.get().strip()
+        if (channel_raw and not channel_raw.isdigit()) or (role_raw and not role_raw.isdigit()):
+            self.status_label.configure(text="Channel/Role IDs must be numbers.", text_color=ERROR)
+            return
+        env_path, guild_id = self.env_path, self.guild_id
+        fields = {
+            "ticket_channel_id": int(channel_raw) if channel_raw else None,
+            "ticket_staff_role_id": int(role_raw) if role_raw else None,
+        }
+        self.status_label.configure(text="Saving...", text_color=MUTED)
+
+        def worker():
+            try:
+                save_guild_config(env_path, guild_id, fields)
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+            self.app.after(
+                0, lambda: self.status_label.configure(text="✅ Saved — the bot will pick this up within a couple minutes.", text_color=SUCCESS)
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _close_ticket(self, ticket: dict) -> None:
+        if self.env_path is None:
+            return
+        if not messagebox.askyesno("Close Ticket?", "This permanently deletes the Discord channel. Continue?"):
+            return
+        env_path = self.env_path
+        self.status_label.configure(text="Closing...", text_color=MUTED)
+
+        def worker():
+            try:
+                try:
+                    _discord_api_request(env_path, "DELETE", f"/channels/{ticket['channel_id']}")
+                except RuntimeError as exc:
+                    if "404" not in str(exc):  # channel already gone is fine, anything else isn't
+                        raise
+                close_ticket_record(env_path, ticket["id"])
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+            self.app.after(0, self.refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_streamer_mode(self, _enabled: bool) -> None:
+        self.refresh()
+
+
+# --------------------------------------------------------------------------------
+# Welcome & Verify page
+# --------------------------------------------------------------------------------
+
+
+class WelcomeVerifyPage(ctk.CTkFrame):
+    """Configure the per-join welcome message and the persistent Verify
+    panel's role grant — oasis/bot.py's on_member_join and WelcomeXPView both
+    read guild_config directly, so a save here takes effect on the very next
+    join / panel re-sync, no bot restart needed."""
+
+    BOT_ID = "leaderboard_bot"
+    DEFAULT_MESSAGE = "Welcome to the server, {member}! 🎉"
+
+    def __init__(self, master, app: "Dashboard"):
+        super().__init__(master, fg_color="transparent")
+        self.app = app
+        self.env_path: Path | None = None
+        self.guild_id: int | None = None
+
+        header_row = ctk.CTkFrame(self, fg_color="transparent")
+        header_row.pack(fill="x", pady=(0, 20))
+        title_col = ctk.CTkFrame(header_row, fg_color="transparent")
+        title_col.pack(side="left")
+        ctk.CTkLabel(title_col, text="👋  Welcome & Verify", font=("Segoe UI", 24, "bold")).pack(anchor="w")
+        ctk.CTkLabel(
+            title_col, text="Per-join welcome message and the Verify panel's role grant", font=("Segoe UI", 12),
+            text_color=MUTED,
+        ).pack(anchor="w", pady=(2, 0))
+
+        self.status_label = ctk.CTkLabel(self, text="", font=("Segoe UI", 12))
+        self.status_label.pack(anchor="w", pady=(0, 14))
+
+        self.guild_picker = add_guild_picker(header_row, app, self.BOT_ID, self.status_label, self._on_guild_changed)
+        self.guild_picker.pack(side="right", anchor="e")
+
+        card = ctk.CTkFrame(self, corner_radius=14, fg_color=CARD_BG)
+        card.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(card, text="Welcome Channel ID", font=("Segoe UI", 13, "bold")).pack(
+            anchor="w", padx=16, pady=(16, 4)
+        )
+        self.channel_entry = ctk.CTkEntry(card, placeholder_text="e.g. 123456789012345678", width=260)
+        self.channel_entry.pack(anchor="w", padx=16)
+        add_tooltip(self.channel_entry, "Hosts both the per-join welcome message and the persistent Verify panel")
+
+        ctk.CTkLabel(card, text="Welcome Message", font=("Segoe UI", 13, "bold")).pack(
+            anchor="w", padx=16, pady=(16, 2)
+        )
+        ctk.CTkLabel(
+            card, text="Placeholders: {member} mentions the new member, {server} is this server's name",
+            font=("Segoe UI", 10), text_color=MUTED,
+        ).pack(anchor="w", padx=16, pady=(0, 4))
+        self.message_box = ctk.CTkTextbox(card, height=90, wrap="word", fg_color="#0e0e16", font=("Segoe UI", 12))
+        self.message_box.pack(fill="x", padx=16)
+
+        ctk.CTkLabel(card, text="Verified Role ID", font=("Segoe UI", 13, "bold")).pack(
+            anchor="w", padx=16, pady=(16, 4)
+        )
+        self.role_entry = ctk.CTkEntry(card, placeholder_text="e.g. 123456789012345678 (optional)", width=260)
+        self.role_entry.pack(anchor="w", padx=16)
+        add_tooltip(self.role_entry, "Granted instantly when a member clicks Verify — leave blank for XP-only verification")
+
+        ctk.CTkButton(
+            card, text="💾  Save", fg_color=ACCENT, hover_color=ACCENT_HOVER, command=self._save
+        ).pack(anchor="w", padx=16, pady=16)
+
+    def _on_guild_changed(self, env_path: Path, guild_id: int) -> None:
+        self.env_path = env_path
+        self.guild_id = guild_id
+        self.refresh()
+
+    def refresh(self) -> None:
+        if self.env_path is None or self.guild_id is None:
+            return
+        env_path, guild_id = self.env_path, self.guild_id
+        self.status_label.configure(text="Loading...", text_color=MUTED)
+
+        def worker():
+            try:
+                config = fetch_guild_config(env_path, guild_id)
+            except Exception as exc:  # noqa: BLE001 - surfacing any fetch error to the UI
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+            self.app.after(0, lambda: self._on_loaded(config))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_loaded(self, config: dict) -> None:
+        self.channel_entry.delete(0, "end")
+        if config.get("welcome_channel_id"):
+            self.channel_entry.insert(0, str(config["welcome_channel_id"]))
+        self.message_box.delete("1.0", "end")
+        self.message_box.insert("1.0", config.get("welcome_message") or self.DEFAULT_MESSAGE)
+        self.role_entry.delete(0, "end")
+        if config.get("verified_role_id"):
+            self.role_entry.insert(0, str(config["verified_role_id"]))
+        self.status_label.configure(text="✅ Loaded.", text_color=SUCCESS)
+
+    def _save(self) -> None:
+        if self.env_path is None or self.guild_id is None:
+            return
+        channel_raw = self.channel_entry.get().strip()
+        role_raw = self.role_entry.get().strip()
+        if (channel_raw and not channel_raw.isdigit()) or (role_raw and not role_raw.isdigit()):
+            self.status_label.configure(text="Channel/Role IDs must be numbers.", text_color=ERROR)
+            return
+        message = self.message_box.get("1.0", "end").strip() or self.DEFAULT_MESSAGE
+
+        env_path, guild_id = self.env_path, self.guild_id
+        fields = {
+            "welcome_channel_id": int(channel_raw) if channel_raw else None,
+            "welcome_message": message,
+            "verified_role_id": int(role_raw) if role_raw else None,
+        }
+        self.status_label.configure(text="Saving...", text_color=MUTED)
+
+        def worker():
+            try:
+                save_guild_config(env_path, guild_id, fields)
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+            self.app.after(
+                0, lambda: self.status_label.configure(text="✅ Saved — the bot will pick this up within a couple minutes.", text_color=SUCCESS)
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_streamer_mode(self, enabled: bool) -> None:
+        """No re-fetch needed — .get() on a masked CTkEntry still returns the
+        real underlying value, `show` only changes how it renders, so Save
+        keeps working correctly while masked."""
+        show = "*" if enabled else ""
+        self.channel_entry.configure(show=show)
+        self.role_entry.configure(show=show)
+
+
+# --------------------------------------------------------------------------------
+# Social Feeds page
+# --------------------------------------------------------------------------------
+
+
+class SocialFeedsPage(ctk.CTkFrame):
+    """Configure TikTok feeds to auto-announce. oasis/bot.py's
+    social_feed_checker polls every enabled row here every 10 minutes — see
+    that function's docstring for why TikTok specifically is best-effort/
+    unofficial (no public API for watching an arbitrary creator's uploads),
+    a caveat repeated in this tab's own copy below so it's visible wherever
+    someone's actually configuring one."""
+
+    BOT_ID = "leaderboard_bot"
+    PING_LABELS = {"everyone": "@everyone", "here": "@here", "none": "No ping"}
+    PING_VALUES = {label: value for value, label in PING_LABELS.items()}
+
+    def __init__(self, master, app: "Dashboard"):
+        super().__init__(master, fg_color="transparent")
+        self.app = app
+        self.env_path: Path | None = None
+        self.guild_id: int | None = None
+
+        header_row = ctk.CTkFrame(self, fg_color="transparent")
+        header_row.pack(fill="x", pady=(0, 20))
+        title_col = ctk.CTkFrame(header_row, fg_color="transparent")
+        title_col.pack(side="left")
+        ctk.CTkLabel(title_col, text="📢  Social Feeds", font=("Segoe UI", 24, "bold")).pack(anchor="w")
+        ctk.CTkLabel(
+            title_col, text="Auto-announce new TikTok posts to a channel", font=("Segoe UI", 12), text_color=MUTED
+        ).pack(anchor="w", pady=(2, 0))
+
+        # Static caveat, distinct from self.status_label below (which is
+        # reused for transient load/save messages and would otherwise
+        # overwrite this on the very first refresh) — this stays visible the
+        # whole time someone's looking at this tab.
+        ctk.CTkLabel(
+            self,
+            text="⚠️ TikTok has no public API for this — detection is best-effort (page scraping) and can "
+            "occasionally miss a post if TikTok changes their page.",
+            font=("Segoe UI", 11),
+            text_color=WARNING,
+            wraplength=760,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 6))
+
+        self.status_label = ctk.CTkLabel(self, text="", font=("Segoe UI", 12))
+        self.status_label.pack(anchor="w", pady=(0, 14))
+
+        self.guild_picker = add_guild_picker(header_row, app, self.BOT_ID, self.status_label, self._on_guild_changed)
+        self.guild_picker.pack(side="right", anchor="e")
+
+        # --- Add Feed ---
+        add_card = ctk.CTkFrame(self, corner_radius=14, fg_color=CARD_BG)
+        add_card.pack(fill="x", pady=(0, 12))
+        ctk.CTkLabel(add_card, text="Add TikTok Feed", font=("Segoe UI", 14, "bold")).pack(
+            anchor="w", padx=16, pady=(14, 6)
+        )
+        add_row = ctk.CTkFrame(add_card, fg_color="transparent")
+        add_row.pack(fill="x", padx=16, pady=(0, 14))
+        self.handle_entry = ctk.CTkEntry(add_row, placeholder_text="TikTok handle (no @)", width=180)
+        self.handle_entry.pack(side="left", padx=(0, 8))
+        self.channel_entry = ctk.CTkEntry(add_row, placeholder_text="Announce Channel ID", width=180)
+        self.channel_entry.pack(side="left", padx=(0, 8))
+        self.ping_menu = ctk.CTkOptionMenu(add_row, values=list(self.PING_LABELS.values()), width=120)
+        self.ping_menu.set(self.PING_LABELS["none"])
+        self.ping_menu.pack(side="left", padx=(0, 8))
+        self.add_feed_btn = ctk.CTkButton(
+            add_row, text="+  Add Feed", fg_color=SUCCESS, hover_color="#3ecf68", text_color="#0e0e16",
+            command=self._add_feed,
+        )
+        self.add_feed_btn.pack(side="left")
+
+        # --- Feed list ---
+        list_card = ctk.CTkFrame(self, corner_radius=16, fg_color=CARD_BG, border_width=1, border_color=BORDER)
+        list_card.pack(fill="both", expand=True)
+        self.rows_frame = ctk.CTkScrollableFrame(
+            list_card, fg_color="transparent", scrollbar_button_color=BORDER, scrollbar_button_hover_color=ACCENT
+        )
+        self.rows_frame.pack(fill="both", expand=True, padx=16, pady=16)
+
+    def _on_guild_changed(self, env_path: Path, guild_id: int) -> None:
+        self.env_path = env_path
+        self.guild_id = guild_id
+        self.refresh()
+
+    def refresh(self) -> None:
+        if self.env_path is None or self.guild_id is None:
+            return
+        env_path, guild_id = self.env_path, self.guild_id
+
+        def worker():
+            try:
+                feeds = list_social_feeds(env_path, guild_id)
+            except Exception as exc:  # noqa: BLE001 - surfacing any fetch error to the UI
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+            self.app.after(0, lambda: self._on_loaded(feeds))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_loaded(self, feeds: list[dict]) -> None:
+        for child in self.rows_frame.winfo_children():
+            child.destroy()
+
+        if not feeds:
+            placeholder = ctk.CTkFrame(self.rows_frame, corner_radius=PREMIUM_CARD_RADIUS, fg_color=ROW_BG)
+            placeholder.pack(fill="x", pady=6)
+            ctk.CTkLabel(placeholder, text="No feeds configured yet — add one above.", text_color=MUTED).pack(
+                padx=18, pady=18
+            )
+        else:
+            for feed in feeds:
+                row = ctk.CTkFrame(self.rows_frame, corner_radius=PREMIUM_CARD_RADIUS, fg_color=ROW_BG)
+                row.pack(fill="x", pady=5, ipady=4)
+                text_col = ctk.CTkFrame(row, fg_color="transparent")
+                text_col.pack(side="left", fill="x", expand=True, padx=(16, 8), pady=8)
+                ctk.CTkLabel(text_col, text=f"@{feed['handle']}", anchor="w", font=("Segoe UI", 13, "bold")).pack(
+                    anchor="w"
+                )
+                ping_label = self.PING_LABELS.get(feed.get("ping_style"), "No ping")
+                channel_text = "••••••" if self.app.streamer_mode else str(feed["channel_id"])
+                ctk.CTkLabel(
+                    text_col, text=f"→ #{channel_text} • {ping_label}", anchor="w", font=("Segoe UI", 10),
+                    text_color=MUTED,
+                ).pack(anchor="w")
+
+                ctk.CTkButton(
+                    row, text="🗑", width=32, height=28, corner_radius=8, fg_color="transparent", border_width=1,
+                    border_color=ERROR, text_color=ERROR, hover_color=DANGER_HOVER,
+                    command=lambda f=feed: self._delete_feed(f),
+                ).pack(side="right", padx=(0, 12))
+
+                enabled_switch = ctk.CTkSwitch(row, text="Enabled", progress_color=ACCENT)
+                if feed.get("enabled"):
+                    enabled_switch.select()
+                enabled_switch.configure(command=lambda f=feed, s=enabled_switch: self._toggle_feed(f, s))
+                enabled_switch.pack(side="right", padx=(0, 12))
+
+        self.status_label.configure(text=f"✅ {len(feeds)} feed(s).", text_color=SUCCESS)
+
+    def _add_feed(self) -> None:
+        if self.env_path is None or self.guild_id is None:
+            return
+        handle = self.handle_entry.get().strip().lstrip("@")
+        channel_raw = self.channel_entry.get().strip()
+        if not handle:
+            self.status_label.configure(text="Enter a TikTok handle.", text_color=ERROR)
+            return
+        if not channel_raw.isdigit():
+            self.status_label.configure(text="Enter a valid Announce Channel ID.", text_color=ERROR)
+            return
+
+        env_path, guild_id = self.env_path, self.guild_id
+        channel_id = int(channel_raw)
+        ping_style = self.PING_VALUES.get(self.ping_menu.get(), "none")
+        self.status_label.configure(text="Adding...", text_color=MUTED)
+
+        def worker():
+            try:
+                add_social_feed(env_path, guild_id, handle, channel_id, ping_style)
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+            self.app.after(0, self._on_feed_added)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_feed_added(self) -> None:
+        self.handle_entry.delete(0, "end")
+        self.channel_entry.delete(0, "end")
+        self.refresh()
+
+    def _delete_feed(self, feed: dict) -> None:
+        if self.env_path is None:
+            return
+        if not messagebox.askyesno("Delete Feed?", f"Stop watching @{feed['handle']}?"):
+            return
+        env_path = self.env_path
+
+        def worker():
+            try:
+                delete_social_feed(env_path, feed["id"])
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+            self.app.after(0, self.refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _toggle_feed(self, feed: dict, switch: ctk.CTkSwitch) -> None:
+        if self.env_path is None:
+            return
+        env_path = self.env_path
+        enabled = bool(switch.get())
+
+        def _revert_switch(error: Exception) -> None:
+            # The switch already flipped to the new (optimistic) position the
+            # instant the user clicked it, before this worker even started —
+            # if the save failed, flip it back so it doesn't sit there
+            # showing a state that was never actually persisted.
+            (switch.deselect if enabled else switch.select)()
+            self.status_label.configure(text=f"❌ {error}", text_color=ERROR)
+
+        def worker():
+            try:
+                set_social_feed_enabled(env_path, feed["id"], enabled)
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                self.app.after(0, lambda: _revert_switch(error))
+                return
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_streamer_mode(self, _enabled: bool) -> None:
+        self.refresh()
+
+
+# --------------------------------------------------------------------------------
 # Settings page
 # --------------------------------------------------------------------------------
 
@@ -2443,6 +3443,10 @@ class Dashboard(ctk.CTk):
         ("Logs", "📜"),
         ("Leaderboard", "📊"),
         ("Audit Log", "🧾"),
+        ("Shop", "🛒"),
+        ("Tickets", "🎫"),
+        ("Welcome & Verify", "👋"),
+        ("Social Feeds", "📢"),
         ("Settings", "⚙️"),
         ("Add Bot", "➕"),
     ]
@@ -2476,7 +3480,7 @@ class Dashboard(ctk.CTk):
 
         ctk.CTkLabel(sidebar, text="🧠 Bot Core", font=("Segoe UI", 18, "bold")).pack(pady=(32, 2), padx=22)
         ctk.CTkLabel(
-            sidebar, text="Ctrl+1-7 tabs · Ctrl+R refresh", font=("Segoe UI", 10), text_color=MUTED
+            sidebar, text="Ctrl+1-9 tabs · Ctrl+R refresh", font=("Segoe UI", 10), text_color=MUTED
         ).pack(pady=(0, 26), padx=22)
 
         self.content = ctk.CTkFrame(self, fg_color="transparent")
@@ -2535,6 +3539,10 @@ class Dashboard(ctk.CTk):
             "Logs": LogsPage(self.content, self),
             "Leaderboard": LeaderboardViewerPage(self.content, self),
             "Audit Log": AuditLogPage(self.content, self),
+            "Shop": ShopManagementPage(self.content, self),
+            "Tickets": TicketsPage(self.content, self),
+            "Welcome & Verify": WelcomeVerifyPage(self.content, self),
+            "Social Feeds": SocialFeedsPage(self.content, self),
             "Settings": SettingsPage(self.content, self),
             "Add Bot": AddBotPage(self.content, self),
         }
