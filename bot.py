@@ -869,8 +869,17 @@ async def perform_previous(guild: discord.Guild, channel: discord.abc.Messageabl
     if prev_index < 0:
         return "❌ لا توجد أغنية سابقة للرجوع إليها! | No previous song in history."
 
-    state.manual_transition = True
+    # manual_transition must only ever be set right before a vc.stop() that's
+    # actually going to happen — it exists purely to tell the after=callback
+    # "this stop was ours, don't auto-advance for it too". Setting it
+    # unconditionally here (the previous bug) meant that if vc wasn't
+    # playing/paused at this exact moment, vc.stop() below never ran, so
+    # nothing ever consumed/reset the flag — it stayed True forever, and the
+    # NEXT time a song finished naturally, _advance_queue saw a stale True,
+    # silently reset it, and returned without starting anything. That's what
+    # "stops advancing to the next song" looked like from the outside.
     if vc.is_playing() or vc.is_paused():
+        state.manual_transition = True
         vc.stop()
 
     result = await start_track(guild, channel, prev_index)
@@ -888,7 +897,6 @@ async def perform_stop(guild: discord.Guild) -> str:
         return "I'm not connected to a voice channel."
 
     state = get_state(guild.id)
-    state.manual_transition = True
 
     if state.disconnect_task is not None and not state.disconnect_task.done():
         state.disconnect_task.cancel()
@@ -896,7 +904,11 @@ async def perform_stop(guild: discord.Guild) -> str:
 
     stop_progress_task(state)
 
+    # See perform_previous's comment: only set this immediately before a
+    # vc.stop() that's actually going to run, or it never gets consumed and
+    # silently blocks the next natural track-end from advancing.
     if vc.is_playing() or vc.is_paused():
+        state.manual_transition = True
         vc.stop()
     await vc.disconnect()
 
@@ -922,8 +934,11 @@ async def perform_jump(guild: discord.Guild, channel: discord.abc.Messageable, i
         return "I'm not connected to a voice channel."
 
     requested_title = state.session_songs[index].title
-    state.manual_transition = True
+    # See perform_previous's comment: only set this immediately before a
+    # vc.stop() that's actually going to run, or it never gets consumed and
+    # silently blocks the next natural track-end from advancing.
     if vc.is_playing() or vc.is_paused():
+        state.manual_transition = True
         vc.stop()
 
     result = await start_track(guild, channel, index)
