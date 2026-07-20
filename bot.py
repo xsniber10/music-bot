@@ -946,6 +946,54 @@ async def play_library_selection(
     return await perform_jump(guild, channel, new_index)
 
 
+async def play_spotify_selection(
+    guild: discord.Guild, channel: discord.abc.Messageable, member: discord.Member, url: str
+) -> str:
+    """Plays one track picked from the currently-cached Spotify playlist
+    (state.spotify_tracks_cache — whichever playlist the user chose in the
+    picker, see SpotifyPlaylistSelect) and queues the REST of that same
+    playlist right after it, in playlist order, starting from the picked
+    track's position. Once _advance_queue's existing sequential logic takes
+    over from there, playback naturally continues through the chosen
+    playlist track by track.
+
+    Deliberately does NOT call load_library_into_session the way
+    play_library_selection does for the general library/queue pickers —
+    that appends every song ever played across every playlist, in library
+    (not playlist) order. Used here, that meant picking a track from a
+    specific Spotify playlist would play that one track and then fall
+    through to an essentially arbitrary song from the whole cross-playlist
+    library — not the next track in the chosen playlist, which is the bug
+    this function exists to fix."""
+    try:
+        song = await extract_song(url, member)
+    except Exception as exc:
+        print(f"Failed to load selected Spotify track '{url}': {exc}")
+        return f"Could not load that song: {exc}"
+
+    await save_song_to_library(song)
+    state = get_state(guild.id)
+    state.session_songs.append(song)
+    new_index = len(state.session_songs) - 1
+
+    cache = state.spotify_tracks_cache or []
+    picked_index = next((i for i, track in enumerate(cache) if track["url"] == url), None)
+    remaining = cache[picked_index + 1 :] if picked_index is not None else []
+    for track in remaining:
+        state.session_songs.append(
+            Song(
+                source_url="",
+                title=track["title"],
+                webpage_url=track["url"],
+                duration=track.get("duration"),
+                thumbnail=None,
+                requester=member,
+            )
+        )
+
+    return await perform_jump(guild, channel, new_index)
+
+
 async def start_track(
     guild: discord.Guild, channel: discord.abc.Messageable, index: int
 ) -> tuple[Song, bool] | None:
@@ -1525,7 +1573,12 @@ class SpotifySelect(discord.ui.Select):
 
         url = value[2:]
         await interaction.response.defer()
-        await play_library_selection(guild, channel, member, url)
+        # play_spotify_selection, NOT play_library_selection — this dropdown
+        # is scoped to state.spotify_tracks_cache (the one playlist the user
+        # picked), and must continue THAT playlist sequentially rather than
+        # falling through to the whole cross-playlist library. See
+        # play_spotify_selection's own docstring for the bug this fixes.
+        await play_spotify_selection(guild, channel, member, url)
 
 
 class SongSearchModal(discord.ui.Modal, title="🔍 البحث عن أغنية | Search Song"):
