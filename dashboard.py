@@ -563,6 +563,41 @@ def delete_shop_item(env_path: Path, item_id: int) -> None:
     _supabase_request(env_path, "DELETE", f"shop_items?id=eq.{item_id}")
 
 
+def list_quests(env_path: Path, guild_id: int) -> list[dict]:
+    return _supabase_request(env_path, "GET", f"quests?guild_id=eq.{guild_id}&order=cooldown.asc,created_at.asc") or []
+
+
+def add_quest(
+    env_path: Path,
+    guild_id: int,
+    title: str,
+    description: str,
+    quest_type: str,
+    target_count: int,
+    xp_reward: int,
+    cooldown: str,
+) -> None:
+    _supabase_request(
+        env_path, "POST", "quests",
+        json_body={
+            "guild_id": guild_id,
+            "title": title,
+            "description": description,
+            "type": quest_type,
+            "target_count": target_count,
+            "xp_reward": xp_reward,
+            "cooldown": cooldown,
+        },
+    )
+
+
+def delete_quest(env_path: Path, quest_id: int) -> None:
+    # ON DELETE CASCADE on user_quests.quest_id (see oasis/bot.py's schema)
+    # takes every member's progress on this quest with it — no separate
+    # cleanup call needed here.
+    _supabase_request(env_path, "DELETE", f"quests?quest_id=eq.{quest_id}")
+
+
 def list_open_tickets(env_path: Path, guild_id: int) -> list[dict]:
     return _supabase_request(env_path, "GET", f"tickets?guild_id=eq.{guild_id}&status=eq.open&order=created_at.desc") or []
 
@@ -2667,6 +2702,207 @@ class ShopManagementPage(ctk.CTkFrame):
 
 
 # --------------------------------------------------------------------------------
+# Quests Management page
+# --------------------------------------------------------------------------------
+
+
+class QuestsManagementPage(ctk.CTkFrame):
+    """Create/delete Daily & Weekly Quests. oasis/bot.py reads `quests`
+    directly and tracks each member's progress in `user_quests` as they
+    chat, spend time in voice, and react — see that file's "Daily & Weekly
+    Quests" section. Nothing here needs a channel/panel setting the way
+    Shop/Tickets/Welcome do: quests are checked in Discord via the /quests
+    slash command, not a persistent panel message."""
+
+    BOT_ID = "leaderboard_bot"
+    TYPES = ("message", "voice", "reaction")
+    COOLDOWNS = ("daily", "weekly")
+
+    def __init__(self, master, app: "Dashboard"):
+        super().__init__(master, fg_color="transparent")
+        self.app = app
+        self.env_path: Path | None = None
+        self.guild_id: int | None = None
+
+        header_row = ctk.CTkFrame(self, fg_color="transparent")
+        header_row.pack(fill="x", pady=(0, 20))
+        title_col = ctk.CTkFrame(header_row, fg_color="transparent")
+        title_col.pack(side="left")
+        ctk.CTkLabel(title_col, text="📜  Quests Management", font=("Segoe UI", 24, "bold")).pack(anchor="w")
+        ctk.CTkLabel(
+            title_col, text="Daily & weekly XP quests members complete in Discord", font=("Segoe UI", 12),
+            text_color=MUTED,
+        ).pack(anchor="w", pady=(2, 0))
+
+        self.status_label = ctk.CTkLabel(self, text="", font=("Segoe UI", 12))
+        self.status_label.pack(anchor="w", pady=(0, 14))
+
+        self.guild_picker = add_guild_picker(header_row, app, self.BOT_ID, self.status_label, self._on_guild_changed)
+        self.guild_picker.pack(side="right", anchor="e")
+
+        # --- Add Quest ---
+        add_card = ctk.CTkFrame(self, corner_radius=14, fg_color=CARD_BG)
+        add_card.pack(fill="x", pady=(0, 12))
+        ctk.CTkLabel(add_card, text="Add Quest", font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=16, pady=(14, 6))
+
+        add_row1 = ctk.CTkFrame(add_card, fg_color="transparent")
+        add_row1.pack(fill="x", padx=16, pady=(0, 8))
+        self.title_entry = ctk.CTkEntry(add_row1, placeholder_text="Title (e.g. Chatterbox)", width=220)
+        self.title_entry.pack(side="left", padx=(0, 8))
+        self.description_entry = ctk.CTkEntry(add_row1, placeholder_text="Description (optional)", width=260)
+        self.description_entry.pack(side="left", padx=(0, 8))
+
+        add_row2 = ctk.CTkFrame(add_card, fg_color="transparent")
+        add_row2.pack(fill="x", padx=16, pady=(0, 14))
+        self.type_menu = ctk.CTkOptionMenu(add_row2, values=list(self.TYPES), width=110)
+        self.type_menu.set(self.TYPES[0])
+        self.type_menu.pack(side="left", padx=(0, 8))
+        add_tooltip(self.type_menu, "message = chat activity, voice = minutes in a voice channel, reaction = adding a reaction")
+        self.target_entry = ctk.CTkEntry(add_row2, placeholder_text="Target Count", width=110)
+        self.target_entry.pack(side="left", padx=(0, 8))
+        self.reward_entry = ctk.CTkEntry(add_row2, placeholder_text="XP Reward", width=100)
+        self.reward_entry.pack(side="left", padx=(0, 8))
+        self.cooldown_menu = ctk.CTkOptionMenu(add_row2, values=list(self.COOLDOWNS), width=100)
+        self.cooldown_menu.set(self.COOLDOWNS[0])
+        self.cooldown_menu.pack(side="left", padx=(0, 8))
+        self.add_quest_btn = ctk.CTkButton(
+            add_row2, text="+  Add Quest", fg_color=SUCCESS, hover_color="#3ecf68", text_color="#0e0e16",
+            command=self._add_quest,
+        )
+        self.add_quest_btn.pack(side="left")
+
+        # --- Quest list ---
+        list_card = ctk.CTkFrame(self, corner_radius=16, fg_color=CARD_BG, border_width=1, border_color=BORDER)
+        list_card.pack(fill="both", expand=True)
+        self.rows_frame = ctk.CTkScrollableFrame(
+            list_card, fg_color="transparent", scrollbar_button_color=BORDER, scrollbar_button_hover_color=ACCENT
+        )
+        self.rows_frame.pack(fill="both", expand=True, padx=16, pady=16)
+
+    def _on_guild_changed(self, env_path: Path, guild_id: int) -> None:
+        self.env_path = env_path
+        self.guild_id = guild_id
+        self.refresh()
+
+    def refresh(self) -> None:
+        if self.env_path is None or self.guild_id is None:
+            return
+        env_path, guild_id = self.env_path, self.guild_id
+        self.status_label.configure(text="Loading...", text_color=MUTED)
+
+        def worker():
+            try:
+                quests = list_quests(env_path, guild_id)
+            except Exception as exc:  # noqa: BLE001 - surfacing any fetch error to the UI
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+            self.app.after(0, lambda: self._on_loaded(quests))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    TYPE_ICONS = {"message": "💬", "voice": "🎙️", "reaction": "✨"}
+
+    def _on_loaded(self, quests: list[dict]) -> None:
+        for child in self.rows_frame.winfo_children():
+            child.destroy()
+
+        if not quests:
+            placeholder = ctk.CTkFrame(self.rows_frame, corner_radius=PREMIUM_CARD_RADIUS, fg_color=ROW_BG)
+            placeholder.pack(fill="x", pady=6)
+            ctk.CTkLabel(placeholder, text="No quests yet — add one above.", text_color=MUTED).pack(padx=18, pady=18)
+        else:
+            for quest in quests:
+                row = ctk.CTkFrame(self.rows_frame, corner_radius=PREMIUM_CARD_RADIUS, fg_color=ROW_BG)
+                row.pack(fill="x", pady=5, ipady=4)
+                text_col = ctk.CTkFrame(row, fg_color="transparent")
+                text_col.pack(side="left", fill="x", expand=True, padx=(16, 8), pady=8)
+                icon = self.TYPE_ICONS.get(quest["type"], "📌")
+                ctk.CTkLabel(
+                    text_col, text=f"{icon} {quest['title']}  ·  {quest['cooldown']}", anchor="w",
+                    font=("Segoe UI", 13, "bold"),
+                ).pack(anchor="w")
+                detail = f"{quest['type']} — target {quest['target_count']:,}"
+                if quest.get("description"):
+                    detail += f" — {quest['description']}"
+                ctk.CTkLabel(text_col, text=detail, anchor="w", font=("Segoe UI", 10), text_color=MUTED).pack(anchor="w")
+                ctk.CTkLabel(
+                    row, text=f"{quest['xp_reward']:,} XP", font=("Segoe UI", 13, "bold"), text_color=ACCENT
+                ).pack(side="right", padx=(0, 12))
+                ctk.CTkButton(
+                    row, text="🗑", width=32, height=28, corner_radius=8, fg_color="transparent", border_width=1,
+                    border_color=ERROR, text_color=ERROR, hover_color=DANGER_HOVER,
+                    command=lambda q=quest: self._delete_quest(q),
+                ).pack(side="right", padx=(0, 8))
+
+        self.status_label.configure(text=f"✅ {len(quests)} quest(s).", text_color=SUCCESS)
+
+    def _add_quest(self) -> None:
+        if self.env_path is None or self.guild_id is None:
+            return
+        title = self.title_entry.get().strip()
+        description = self.description_entry.get().strip()
+        quest_type = self.type_menu.get()
+        target_raw = self.target_entry.get().strip()
+        reward_raw = self.reward_entry.get().strip()
+        cooldown = self.cooldown_menu.get()
+
+        if not title:
+            self.status_label.configure(text="Enter a title for the quest.", text_color=ERROR)
+            return
+        if not target_raw.isdigit() or int(target_raw) <= 0:
+            self.status_label.configure(text="Target Count must be a positive whole number.", text_color=ERROR)
+            return
+        if not reward_raw.isdigit() or int(reward_raw) <= 0:
+            self.status_label.configure(text="XP Reward must be a positive whole number.", text_color=ERROR)
+            return
+
+        env_path, guild_id = self.env_path, self.guild_id
+        target_count, xp_reward = int(target_raw), int(reward_raw)
+        self.status_label.configure(text="Adding...", text_color=MUTED)
+
+        def worker():
+            try:
+                add_quest(env_path, guild_id, title, description, quest_type, target_count, xp_reward, cooldown)
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+            self.app.after(0, self._on_quest_added)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_quest_added(self) -> None:
+        self.title_entry.delete(0, "end")
+        self.description_entry.delete(0, "end")
+        self.target_entry.delete(0, "end")
+        self.reward_entry.delete(0, "end")
+        self.refresh()
+
+    def _delete_quest(self, quest: dict) -> None:
+        if self.env_path is None:
+            return
+        if not messagebox.askyesno("Delete Quest?", f"Delete \"{quest['title']}\"? Every member's progress on it goes with it."):
+            return
+        env_path = self.env_path
+        self.status_label.configure(text="Deleting...", text_color=MUTED)
+
+        def worker():
+            try:
+                delete_quest(env_path, quest["quest_id"])
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                self.app.after(0, lambda: self.status_label.configure(text=f"❌ {error}", text_color=ERROR))
+                return
+            self.app.after(0, self.refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_streamer_mode(self, _enabled: bool) -> None:
+        self.refresh()
+
+
+# --------------------------------------------------------------------------------
 # Support Tickets page
 # --------------------------------------------------------------------------------
 
@@ -2861,9 +3097,10 @@ class TicketsPage(ctk.CTkFrame):
 
 
 class WelcomeVerifyPage(ctk.CTkFrame):
-    """Configure the per-join welcome message and the persistent Verify
-    panel's role grant — oasis/bot.py's on_member_join and WelcomeXPView both
-    read guild_config directly, so a save here takes effect on the very next
+    """Configure the per-join welcome message, the premium "ديوان" join
+    embed's Rules/Roles/Chat buttons, and the persistent Verify panel's role
+    grant — oasis/bot.py's on_member_join and WelcomeXPView both read
+    guild_config directly, so a save here takes effect on the very next
     join / panel re-sync, no bot restart needed."""
 
     BOT_ID = "leaderboard_bot"
@@ -2918,6 +3155,35 @@ class WelcomeVerifyPage(ctk.CTkFrame):
         self.role_entry.pack(anchor="w", padx=16)
         add_tooltip(self.role_entry, "Granted instantly when a member clicks Verify — leave blank for XP-only verification")
 
+        ctk.CTkLabel(card, text="ديوان Join Embed — Buttons", font=("Segoe UI", 13, "bold")).pack(
+            anchor="w", padx=16, pady=(16, 2)
+        )
+        ctk.CTkLabel(
+            card, text="Each is optional — a button is only shown if its channel ID is set here",
+            font=("Segoe UI", 10), text_color=MUTED,
+        ).pack(anchor="w", padx=16, pady=(0, 6))
+
+        buttons_row = ctk.CTkFrame(card, fg_color="transparent")
+        buttons_row.pack(fill="x", padx=16)
+
+        rules_col = ctk.CTkFrame(buttons_row, fg_color="transparent")
+        rules_col.pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(rules_col, text="📜 القوانين", font=("Segoe UI", 11)).pack(anchor="w")
+        self.rules_channel_entry = ctk.CTkEntry(rules_col, placeholder_text="Rules Channel ID", width=190)
+        self.rules_channel_entry.pack(anchor="w", pady=(2, 0))
+
+        roles_col = ctk.CTkFrame(buttons_row, fg_color="transparent")
+        roles_col.pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(roles_col, text="🎭 الأدوار", font=("Segoe UI", 11)).pack(anchor="w")
+        self.roles_channel_entry = ctk.CTkEntry(roles_col, placeholder_text="Roles Channel ID", width=190)
+        self.roles_channel_entry.pack(anchor="w", pady=(2, 0))
+
+        chat_col = ctk.CTkFrame(buttons_row, fg_color="transparent")
+        chat_col.pack(side="left")
+        ctk.CTkLabel(chat_col, text="💬 الدردشة", font=("Segoe UI", 11)).pack(anchor="w")
+        self.chat_channel_entry = ctk.CTkEntry(chat_col, placeholder_text="Chat Channel ID", width=190)
+        self.chat_channel_entry.pack(anchor="w", pady=(2, 0))
+
         ctk.CTkButton(
             card, text="💾  Save", fg_color=ACCENT, hover_color=ACCENT_HOVER, command=self._save
         ).pack(anchor="w", padx=16, pady=16)
@@ -2953,6 +3219,16 @@ class WelcomeVerifyPage(ctk.CTkFrame):
         self.role_entry.delete(0, "end")
         if config.get("verified_role_id"):
             self.role_entry.insert(0, str(config["verified_role_id"]))
+
+        for entry, key in (
+            (self.rules_channel_entry, "rules_channel_id"),
+            (self.roles_channel_entry, "roles_channel_id"),
+            (self.chat_channel_entry, "chat_channel_id"),
+        ):
+            entry.delete(0, "end")
+            if config.get(key):
+                entry.insert(0, str(config[key]))
+
         self.status_label.configure(text="✅ Loaded.", text_color=SUCCESS)
 
     def _save(self) -> None:
@@ -2960,7 +3236,11 @@ class WelcomeVerifyPage(ctk.CTkFrame):
             return
         channel_raw = self.channel_entry.get().strip()
         role_raw = self.role_entry.get().strip()
-        if (channel_raw and not channel_raw.isdigit()) or (role_raw and not role_raw.isdigit()):
+        rules_raw = self.rules_channel_entry.get().strip()
+        roles_raw = self.roles_channel_entry.get().strip()
+        chat_raw = self.chat_channel_entry.get().strip()
+        id_fields = (channel_raw, role_raw, rules_raw, roles_raw, chat_raw)
+        if any(raw and not raw.isdigit() for raw in id_fields):
             self.status_label.configure(text="Channel/Role IDs must be numbers.", text_color=ERROR)
             return
         message = self.message_box.get("1.0", "end").strip() or self.DEFAULT_MESSAGE
@@ -2970,6 +3250,9 @@ class WelcomeVerifyPage(ctk.CTkFrame):
             "welcome_channel_id": int(channel_raw) if channel_raw else None,
             "welcome_message": message,
             "verified_role_id": int(role_raw) if role_raw else None,
+            "rules_channel_id": int(rules_raw) if rules_raw else None,
+            "roles_channel_id": int(roles_raw) if roles_raw else None,
+            "chat_channel_id": int(chat_raw) if chat_raw else None,
         }
         self.status_label.configure(text="Saving...", text_color=MUTED)
 
@@ -2993,6 +3276,9 @@ class WelcomeVerifyPage(ctk.CTkFrame):
         show = "*" if enabled else ""
         self.channel_entry.configure(show=show)
         self.role_entry.configure(show=show)
+        self.rules_channel_entry.configure(show=show)
+        self.roles_channel_entry.configure(show=show)
+        self.chat_channel_entry.configure(show=show)
 
 
 # --------------------------------------------------------------------------------
@@ -3478,6 +3764,7 @@ class Dashboard(ctk.CTk):
         ("Leaderboard", "📊"),
         ("Audit Log", "🧾"),
         ("Shop", "🛒"),
+        ("Quests", "📜"),
         ("Tickets", "🎫"),
         ("Welcome & Verify", "👋"),
         ("Social Feeds", "📢"),
@@ -3574,6 +3861,7 @@ class Dashboard(ctk.CTk):
             "Leaderboard": LeaderboardViewerPage(self.content, self),
             "Audit Log": AuditLogPage(self.content, self),
             "Shop": ShopManagementPage(self.content, self),
+            "Quests": QuestsManagementPage(self.content, self),
             "Tickets": TicketsPage(self.content, self),
             "Welcome & Verify": WelcomeVerifyPage(self.content, self),
             "Social Feeds": SocialFeedsPage(self.content, self),
